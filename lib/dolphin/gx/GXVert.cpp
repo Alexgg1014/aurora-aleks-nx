@@ -91,10 +91,12 @@ void GXEnd() {
   }
 }
 
+// aleks2 (V1-rc12): the immediate-mode attributes the game sends per vertex (grass, particles, 2D) go to the FIFO
+// in one append each: the same bytes, one capacity check and one size update instead of one per component (the
+// console profile had GXPosition3f32 + GXColor4u8 at ~6 % of the game thread in Castle Town).
 void GXPosition3f32(f32 x, f32 y, f32 z) {
-  GX_WRITE_F32(x);
-  GX_WRITE_F32(y);
-  GX_WRITE_F32(z);
+  const f32 v[3] = {bswap(x), bswap(y), bswap(z)};
+  aurora::gx::fifo::write_data(v, sizeof(v));
 }
 
 void GXPosition3u16(u16 x, u16 y, u16 z) {
@@ -122,8 +124,8 @@ void GXPosition3s8(s8 x, s8 y, s8 z) {
 }
 
 void GXPosition2f32(f32 x, f32 y) {
-  GX_WRITE_F32(x);
-  GX_WRITE_F32(y);
+  const f32 v[2] = {bswap(x), bswap(y)};
+  aurora::gx::fifo::write_data(v, sizeof(v));
 }
 
 void GXPosition2u16(u16 x, u16 y) {
@@ -151,9 +153,8 @@ void GXPosition1x16(u16 idx) { GX_WRITE_U16(idx); }
 void GXPosition1x8(u8 idx) { GX_WRITE_U8(idx); }
 
 void GXNormal3f32(f32 x, f32 y, f32 z) {
-  GX_WRITE_F32(x);
-  GX_WRITE_F32(y);
-  GX_WRITE_F32(z);
+  const f32 v[3] = {bswap(x), bswap(y), bswap(z)};
+  aurora::gx::fifo::write_data(v, sizeof(v));
 }
 
 void GXNormal3s16(s16 x, s16 y, s16 z) {
@@ -180,16 +181,13 @@ void GXColor4f32(f32 r, f32 g, f32 b, f32 a) {
 }
 
 void GXColor4u8(u8 r, u8 g, u8 b, u8 a) {
-  GX_WRITE_U8(r);
-  GX_WRITE_U8(g);
-  GX_WRITE_U8(b);
-  GX_WRITE_U8(a);
+  const u8 v[4] = {r, g, b, a};
+  aurora::gx::fifo::write_data(v, sizeof(v));
 }
 
 void GXColor3u8(u8 r, u8 g, u8 b) {
-  GX_WRITE_U8(r);
-  GX_WRITE_U8(g);
-  GX_WRITE_U8(b);
+  const u8 v[3] = {r, g, b};
+  aurora::gx::fifo::write_data(v, sizeof(v));
 }
 
 void GXColor1u32(u32 clr) { GX_WRITE_U32(clr); }
@@ -201,8 +199,8 @@ void GXColor1x16(u16 index) { GX_WRITE_U16(index); }
 void GXColor1x8(u8 index) { GX_WRITE_U8(index); }
 
 void GXTexCoord2f32(f32 s, f32 t) {
-  GX_WRITE_F32(s);
-  GX_WRITE_F32(t);
+  const f32 v[2] = {bswap(s), bswap(t)};
+  aurora::gx::fifo::write_data(v, sizeof(v));
 }
 
 void GXTexCoord2u16(u16 s, u16 t) {

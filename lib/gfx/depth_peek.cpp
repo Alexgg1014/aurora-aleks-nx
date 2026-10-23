@@ -14,6 +14,10 @@
 
 #include <magic_enum.hpp>
 #include <tracy/Tracy.hpp>
+#if defined(AURORA_GFX_DEKO3D)
+#include "dk_gfx.hpp"
+#include "dk_runtime.hpp"
+#endif
 
 namespace aurora::gfx::depth_peek {
 namespace {
@@ -306,6 +310,14 @@ void complete_slot(size_t slotIdx, wgpu::MapAsyncStatus status, wgpu::StringView
 } // namespace
 
 void initialize() {
+#if defined(AURORA_GFX_DEKO3D)
+  // aleks2 (deko3d P1, after SwitchWaker patch 0016): the deko3d encoder copies the depth itself
+  // (take_snapshot_request), no compute pass on Dawn's Null device
+  if (dk::active()) {
+    g_enabled = true;
+    return;
+  }
+#endif
   if (!webgpu::g_hasCoreFeatures) {
     return;
   }
@@ -332,6 +344,11 @@ void request_snapshot() noexcept {
 }
 
 bool read_latest(uint16_t x, uint16_t y, uint32_t& z) noexcept {
+#if defined(AURORA_GFX_DEKO3D)
+  if (dk::active()) {
+    return dk::depth_peek_read(x, y, z);
+  }
+#endif
   std::lock_guard lock{g_mutex};
   if (x >= g_latest.width || y >= g_latest.height || g_latest.data.empty()) {
     return false;
@@ -339,6 +356,37 @@ bool read_latest(uint16_t x, uint16_t y, uint32_t& z) noexcept {
   z = g_latest.data[static_cast<size_t>(y) * g_latest.width + x] & 0x00ffffffu;
   return true;
 }
+
+#if defined(AURORA_GFX_DEKO3D)
+bool take_snapshot_request(uint32_t sourceWidth, uint32_t sourceHeight, SnapshotMapping& mapping) noexcept {
+  if (!g_enabled) {
+    return false;
+  }
+  const auto now = Clock::now();
+  {
+    std::lock_guard lock{g_mutex};
+    if (!g_snapshotRequested || now < g_nextSnapshotTime) {
+      return false;
+    }
+    g_snapshotRequested = false;
+    g_nextSnapshotTime = now + SnapshotInterval;
+  }
+  const auto dstSize = vi::configured_fb_size();
+  if (dstSize.x == 0 || dstSize.y == 0 || sourceWidth == 0 || sourceHeight == 0) {
+    return false;
+  }
+  const Params params = make_params(wgpu::Extent3D{.width = sourceWidth, .height = sourceHeight}, dstSize);
+  mapping = {
+      .logicalWidth = params.dstWidth,
+      .logicalHeight = params.dstHeight,
+      .offsetX = params.offsetX,
+      .offsetY = params.offsetY,
+      .scaleX = params.scaleX,
+      .scaleY = params.scaleY,
+  };
+  return true;
+}
+#endif
 
 void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& depthView,
                            wgpu::Extent3D sourceSize, uint32_t msaaSamples) noexcept {

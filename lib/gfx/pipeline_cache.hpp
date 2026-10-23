@@ -25,8 +25,19 @@ enum class ShaderType : uint8_t {
 struct CompiledPipeline {
   wgpu::RenderPipeline main;
   wgpu::RenderPipeline prepass;
+#if defined(AURORA_GFX_DEKO3D)
+  // aleks2 (deko3d P1): the deko3d renderer's pipelines (lib/deko/dk_gfx.hpp); main and prepass stay
+  // null with it.
+  const void* dkMain = nullptr;
+  const void* dkPrepass = nullptr;
+#endif
 
   [[nodiscard]] uint32_t pipeline_count() const {
+#if defined(AURORA_GFX_DEKO3D)
+    if (dkMain != nullptr) {
+      return 1u + static_cast<uint32_t>(dkPrepass != nullptr);
+    }
+#endif
     return static_cast<uint32_t>(static_cast<bool>(main)) + static_cast<uint32_t>(static_cast<bool>(prepass));
   }
 };

@@ -1,0 +1,106 @@
+#pragma once
+// Adapted from SwitchWaker (MIT), 084291f: switch/deko/aurora/dk_gfx.hpp. Changes for Dusklight (aleks2
+// deko3d P1): the hooks are called only when dk::active() (dk_runtime.hpp), not under a compile-time
+// switch; RmlUi's pipelines and present layers.
+// The deko3d renderer's side of Aurora's gfx layer (docs/DEKO3D_MIGRATION_PLAN.md phase 3): what
+// Aurora's Switch patches 0013-0014 call with AURORA_GFX_DEKO3D (the deko3d NRO). Aurora still
+// records each frame as it does for WebGPU (FramePacket: render passes of draw commands, texture
+// uploads, copies), with its uniform packing, caches and pipeline cache unchanged, and Dawn's Null
+// device keeps its object model (dk_objects.hpp); these functions turn the recorded frame into
+// deko3d commands on the render worker instead of Dawn's encoders:
+//   frame       Aurora's staging buffers are deko3d memory the FIFO thread writes and the GPU reads in
+//               place (no copies); a staging slot is reused once the GPU has finished its frame
+//   passes      render targets, load-op clears, viewport, scissor, blend constant, a barrier at
+//               every pass end; palette conversions before their pass, EFB copies (copy engine) and
+//               conversions (draws with the fixed shaders) after it
+//   draws       GX draws (pipeline state cache, shaders, uniform buffer at its dynamic offset, the
+//               64-byte immediates in uniform buffer 15, storage buffers 0 and 1 with their regions'
+//               sizes, the 8 texture handles of the bind group, u16 indices) and the partial-clear
+//               draws
+//   pipelines   built on Aurora's compile thread: the module's DKSH from the caches, or WGSL -> Tint ->
+//               post-pass -> the uam worker for a miss; the GX fixed state as gx::pipeline_state_desc
+//               gives it
+//   present     the EFB resampled (area or bilinear) and drawn with the aspect fit, under ImGui
+//   readback    read_texture (the picto box, COS_SHOT); depth_peek_read (GXPeekZ: the sun's glare)
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+#include <webgpu/webgpu_cpp.h>
+
+namespace aurora::gfx {
+struct RenderTargetLayout;
+namespace detail {
+struct FramePacket;
+struct FrameOp;
+}  // namespace detail
+namespace clear {
+struct PipelineConfig;
+}
+}  // namespace aurora::gfx
+namespace aurora::gx {
+struct PipelineConfig;
+struct PipelineOptions;
+}  // namespace aurora::gx
+namespace aurora::rmlui {
+struct PipelineConfig;
+}  // namespace aurora::rmlui
+
+namespace aurora::gfx::dk {
+
+// ---- frame (frame.cpp hooks)
+struct StagingMemory {
+    uint8_t* cpu = nullptr;
+    uint64_t gpu = 0;
+};
+// Aurora's staging slot `slot` (game thread, gfx::initialize): its memory, size bytes
+StagingMemory staging_create(size_t slot, uint64_t size);
+// any thread: the GPU has finished the last frame that read the slot
+bool staging_ready(size_t slot);
+// render worker: the frame being recorded reads the slot (begin_frame's work item)
+void frame_begin(detail::FramePacket& frame);
+// render worker: one sealed pass, copy or task with the uploads queued before it (encode_op)
+void encode_op(detail::FramePacket& frame, const detail::FrameOp& op);
+// render worker, after the present (Aurora's end_frame work item): the staging slot's frame
+void frame_presented(size_t stagingSlot);
+// registers the picture callback with switch/deko (gfx::initialize)
+void present_init();
+
+// ---- pipelines (Aurora's compile thread)
+// A deko3d pipeline (an opaque const Pipe*) for one GX pass of a config, or null if its shaders
+// cannot be made (logged)
+const void* build_gx_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout,
+                              const gx::PipelineOptions& options);
+const void* build_clear_pipeline(const clear::PipelineConfig& config, const RenderTargetLayout& layout);
+// gx/pipeline.cpp's choice for a destination alpha with source-alpha blending: dual-source blending
+// (COS_DK_DUAL_SOURCE=1, once the console showed uam's second output reaches the blender) or the
+// alpha prepass (the default)
+bool dual_source_blending();
+// aleks2 (deko3d P1): an RmlUi pipeline (dk_rmlui.cpp), or null if its shaders cannot be made (logged)
+const void* build_rml_pipeline(const rmlui::PipelineConfig& config);
+
+// ---- present (aurora.cpp end_frame, render worker): RmlUi's layer for this present. rml is the bind
+// group of RmlUi's composite (rmlui::record_frame); overlay: drawn over the game's picture with
+// premultiplied alpha, else it replaces it (RmlUi composited the game itself). Null: the game alone.
+void set_present_layers(WGPUBindGroup rml, bool overlay);
+
+// ---- uploads larger than a frame's texture staging (recording.cpp queue_texture_upload_data)
+struct OverflowUpload {
+    void* block = nullptr;  // a DkMemBlock, freed once the GPU has used it
+    uint64_t gpu = 0;
+};
+OverflowUpload overflow_upload(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage);
+
+// ---- readback (render worker): level 0 of a texture, tightly packed rows of 4-byte texels; false
+// (logged) if the texture is unknown or not 4 bytes per texel. Waits for the GPU.
+bool read_texture(WGPUTexture texture, std::vector<uint8_t>& pixels, uint32_t& width, uint32_t& height,
+                  wgpu::TextureFormat& format, uint32_t mip = 0);
+
+// ---- depth peek (GXPeekZ; depth_peek.cpp with switch/native/aurora/patches/0016, issue #7)
+// Game thread: the GX depth (24 bits, 0xFFFFFF at the far plane) at logical EFB pixel (x, y) from the newest
+// depth copy the GPU has finished, without waiting; false when none covers the point (GXPeekZ then reads
+// 0, as before any copy). The point widens the area the next copy takes (encode_pass: the frame's last
+// EFB pass, when the game asked for a snapshot).
+bool depth_peek_read(uint16_t x, uint16_t y, uint32_t& z);
+
+}  // namespace aurora::gfx::dk

@@ -465,4 +465,49 @@ void present(const wgpu::TextureView& frameTarget) {
   webgpu::g_queue.Submit(1, &buffer);
 }
 
+bool deko_companion(int outW, int outH, uint32_t ownedW, uint32_t ownedH, DekoCompanion* out) {
+  // aleks2 (deko3d rc12): present()'s decisions, the GPU work left to dk_present.cpp
+  Source source;
+  bool sourceIsNew = false;
+  {
+    std::lock_guard lock{g_mutex};
+    if (!g_active) {
+      return false;
+    }
+    source = g_source;
+    sourceIsNew = g_sourceIsNew;
+    g_sourceIsNew = false;
+  }
+  *out = {};
+  if (sourceIsNew && source.view != nullptr && source.width != 0 && source.height != 0) {
+    out->newSource = source.view.Get();
+    ownedW = source.width;
+    ownedH = source.height;
+  }
+  if (ownedW == 0 || ownedH == 0 || outW <= 0 || outH <= 0) {
+    return false; // nothing has ever been drawn yet
+  }
+  lay::Rect dst{};
+  bool rotated = false;
+  uint32_t reportW = 0;
+  uint32_t reportH = 0;
+  const bool draw = companion_target(outW, outH, ownedW, ownedH, &dst, &rotated, &reportW, &reportH);
+  if (draw) {
+    g_reportedW.store(reportW);
+    g_reportedH.store(reportH);
+  }
+  out->width = ownedW;
+  out->height = ownedH;
+  if (draw) { // otherwise w = h = 0: copy the new source, draw nothing
+    out->x = dst.x;
+    out->y = dst.y;
+    out->w = dst.w;
+    out->h = dst.h;
+  }
+  out->rotated = rotated;
+  out->dim = g_dim.load();
+  // a new source is copied even when the layout hides it, as present() does
+  return draw || out->newSource != nullptr;
+}
+
 } // namespace aurora::auxwin

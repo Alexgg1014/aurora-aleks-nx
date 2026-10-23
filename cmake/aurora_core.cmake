@@ -3,6 +3,8 @@ add_library(aurora_core STATIC
         lib/device.cpp
         lib/device_switch.cpp
         lib/sqlite_switch_paths.cpp
+        lib/sqlite_cache_open.cpp
+        lib/sqlite_selftest.cpp
         lib/device.hpp
         lib/input.cpp
         lib/io.cpp
@@ -77,6 +79,7 @@ if (AURORA_ENABLE_GX)
             lib/webgpu/gpu.cpp
             lib/webgpu/gpu_cache.cpp
             lib/webgpu/gpu_prof.cpp
+            lib/webgpu/gpu_timing.cpp
             lib/dawn/BackendBinding.cpp
             lib/dawn/TracyPlatform.cpp
     )

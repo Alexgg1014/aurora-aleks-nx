@@ -25,6 +25,7 @@ private:
 
   friend DrawData freeze() noexcept;
   friend void render(const wgpu::RenderPassEncoder& pass, const DrawData& drawData) noexcept;
+  friend void present_deko3d(const DrawData& drawData) noexcept;
 };
 
 void create_context() noexcept;
@@ -36,4 +37,6 @@ bool wants_capture_event(const SDL_Event& event) noexcept;
 void new_frame(const AuroraWindowSize& size) noexcept;
 DrawData freeze() noexcept;
 void render(const wgpu::RenderPassEncoder& pass, const DrawData& drawData) noexcept;
+// aleks2 (deko3d P1): the deko3d renderer's present (lib/deko) with this frame's ImGui draw data
+void present_deko3d(const DrawData& drawData) noexcept;
 } // namespace aurora::imgui

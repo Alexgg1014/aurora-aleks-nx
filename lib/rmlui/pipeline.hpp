@@ -102,4 +102,16 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 
 uint32_t sampler_mode() noexcept;
 
+#if defined(AURORA_GFX_DEKO3D)
+} // namespace aurora::rmlui
+#include <string_view>
+namespace aurora::rmlui {
+// aleks2 (deko3d P1): for lib/deko/dk_rmlui.cpp (the WGSL of each stage; the common bind group; whether a
+// group of a draw is bound at a dynamic offset)
+std::string_view vertex_wgsl(VertexLayoutKind kind);
+std::string_view fragment_wgsl(PipelineKind kind);
+gfx::BindGroupRef deko3d_common_bind_group();
+bool deko3d_group_dynamic(const DrawData& data, uint32_t group);
+#endif
+
 } // namespace aurora::rmlui

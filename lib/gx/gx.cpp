@@ -1,3 +1,4 @@
+#include <aurora/tuning.h>
 #include "gx.hpp"
 
 #include "pipeline.hpp"
@@ -379,12 +380,45 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
   return g_device.CreateRenderPipeline(&descriptor);
 }
 
+#if defined(AURORA_GFX_DEKO3D)
+// aleks2 (deko3d P1, after SwitchWaker patch 0014): build_pipeline's fixed state, as it hands it to Dawn
+PipelineStateDesc pipeline_state_desc(const PipelineConfig& config, const gfx::RenderTargetLayout& layout,
+                                      const PipelineOptions& options) noexcept {
+  const float depthBias = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetBits);
+  const float depthBiasSlopeScale = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetScaleBits);
+  const float depthBiasClamp = webgpu::g_hasCoreFeatures ? std::bit_cast<float>(config.polygonOffsetClampBits) : 0.0f;
+  const bool writesDepth = config.depthCompare && options.depthUpdate;
+  PipelineStateDesc desc;
+  desc.hasDepth = layout.depthStencilFormat != wgpu::TextureFormat::Undefined;
+  desc.depthStencil = wgpu::DepthStencilState{
+      .format = layout.depthStencilFormat,
+      .depthWriteEnabled = writesDepth,
+      .depthCompare = config.depthCompare ? to_compare_function(config.depthFunc) : wgpu::CompareFunction::Always,
+      .depthBias = round_away_from_zero<int32_t>(depthBias),
+      .depthBiasSlopeScale = depthBiasSlopeScale,
+      .depthBiasClamp = depthBiasClamp,
+  };
+  desc.blend = to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp, config.dstAlpha,
+                              options.dstAlphaMode == DstAlphaMode::DualSource);
+  desc.colorCount = layout.colorAttachmentCount;
+  for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
+    desc.writeMasks[i] = layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::Normal && writesDepth
+                             ? wgpu::ColorWriteMask::All
+                             : wgpu::ColorWriteMask::None;
+  }
+  desc.writeMasks[gfx::SceneColorAttachmentIndex] = to_write_mask(options.colorUpdate, options.alphaUpdate);
+  desc.primitive = to_primitive_state(config.cullMode);
+  return desc;
+}
+#endif
+
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
   ZoneScoped;
 
   const auto& vtxFmt = g_gxState.vtxFmts[fmt];
   config.shaderConfig = {};
-  config.shaderConfig.fogType = g_gxState.fog.type;
+  // aleks2 (V1-rc12): AURORA_DEBUG_FOG_OFF (tuning.h), for the black-ground bisect.
+  config.shaderConfig.fogType = (aurora_debug_flags() & AURORA_DEBUG_FOG_OFF) != 0 ? GX_FOG_NONE : g_gxState.fog.type;
   config.shaderConfig.fogRangeEnabled = g_gxState.fog.rangeEnabled;
   u8 vtxOffset = 0;
   for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {

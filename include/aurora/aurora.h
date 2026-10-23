@@ -27,6 +27,8 @@ typedef enum {
   BACKEND_OPENGLES,
   BACKEND_WEBGPU,
   BACKEND_NULL,
+  /* aleks2 (deko3d P1): the Switch deko3d renderer (lib/deko), Experimental */
+  BACKEND_DEKO3D,
 } AuroraBackend;
 
 typedef enum {
@@ -141,6 +143,8 @@ void aurora_set_timescale(float scale);
 
 AuroraBackend aurora_get_backend();
 const AuroraBackend* aurora_get_available_backends(size_t* count);
+/* aleks2 (deko3d P1): deko3d was chosen but this start fell back to Dawn/NVK (two starts without a frame) */
+bool aurora_deko3d_fell_back(void);
 float aurora_get_timescale();
 
 #ifdef __cplusplus

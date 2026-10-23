@@ -89,5 +89,23 @@ size_t load_from_cache(void const* key, size_t keySize, void* value, size_t valu
 void store_to_cache(void const* key, size_t keySize, void const* value, size_t valueSize, void* userdata);
 void cache_prune();
 void cache_shutdown();
+bool cache_copy_running();  // V1-rc3: the bundled shader cache is still being copied (gpu_cache.cpp)
+
+// aleks2 (SHADERS-c1): the Dawn cache's health and counters for this launch.
+struct CacheCounters {
+  uint32_t hits = 0;
+  uint32_t misses = 0;
+  uint32_t stores = 0;
+  double storeMsTotal = 0.0;
+  double storeMsMax = 0.0;
+  bool opened = false;
+  bool dirty = false;
+  bool repaired = false;
+  double checkMs = 0.0;
+  std::string journal;
+};
+CacheCounters cache_counters();
+// "<device>|<description>": what a Dawn seed is keyed on.
+std::string driver_identity();
 
 } // namespace aurora::webgpu

@@ -600,6 +600,15 @@ private:
 
 UniformRepeat g_uniformRepeat;
 
+// aleks2 (FIFO-opt, UNIFORM_IN_PLACE): the last block written in place, by its range in
+// this frame's uniform buffer. Either path forgets the other's last block, so each one
+// only ever compares with a block it placed itself.
+struct InPlaceLast {
+  bool valid = false;
+  gfx::Range range{};
+};
+InPlaceLast g_inPlaceLast;
+
 // ---------------------------------------------------------------------------------
 // aleks2 (H35): reuse of the uniform block when only the pipeline changed. The input
 // audit and the argument for each condition are in docs/switch-h35-fifo-plan.md of
@@ -716,6 +725,7 @@ ByteBuffer& scratch_block() noexcept {
 }
 
 gfx::Range push_full(const ByteBuffer& block) noexcept {
+  g_inPlaceLast.valid = false;
   bool repeated = false;
   const gfx::Range range = g_uniformRepeat.push(block, repeated);
   bump(g_reuseStats.fullBuilds);
@@ -761,6 +771,7 @@ void report_mismatch(const ShaderInfo& info, const ByteBuffer& correct, const By
 
 void forget_last_uniform() noexcept {
   g_uniformRepeat.forget();
+  g_inPlaceLast.valid = false;
   ++g_uniformEpoch;
 }
 
@@ -772,8 +783,39 @@ void testing::rearm_uniform_reuse() noexcept {
   g_reuseDisabled.store(false, std::memory_order_relaxed);
 }
 
+// aleks2 (FIFO-opt, UNIFORM_IN_PLACE): build_uniform without the scratch block. The
+// block is filled straight into the frame's uniform buffer, after the padding
+// push_uniform would add. If it equals the previous block (memcmp: exact, where the
+// hash path trusts size + xxh3), the padding and the block are taken back and the
+// previous range is returned, as UniformRepeat returns it without pushing.
+static gfx::Range build_uniform_in_place(const ShaderInfo& info) noexcept {
+  size_t unpadded = 0;
+  ByteBuffer* buf = gfx::begin_uniform_block(unpadded);
+  if (buf == nullptr) {
+    return {}; // push_uniform outside a frame
+  }
+  g_uniformRepeat.forget();
+  const size_t begin = buf->size();
+  fill_uniform(*buf, info, NoSectionMarks{});
+  const size_t size = buf->size() - begin;
+  bump(g_reuseStats.fullBuilds);
+  bump(g_fifoFastStats.uniformInPlaceBlocks);
+  if (g_inPlaceLast.valid && g_inPlaceLast.range.size == size &&
+      std::memcmp(buf->data() + g_inPlaceLast.range.offset, buf->data() + begin, size) == 0) {
+    buf->truncate(unpadded);
+    bump(g_reuseStats.repeatHits);
+    bump(g_fifoFastStats.uniformInPlaceRepeats);
+    return g_inPlaceLast.range;
+  }
+  g_inPlaceLast = {true, {static_cast<uint32_t>(begin), static_cast<uint32_t>(size)}};
+  return g_inPlaceLast.range;
+}
+
 gfx::Range build_uniform(const ShaderInfo& info) noexcept {
   ZoneScoped;
+  if ((g_fifoFast.load(std::memory_order_relaxed) & AURORA_FIFO_FAST_UNIFORM_IN_PLACE) != 0) {
+    return build_uniform_in_place(info);
+  }
   auto& buf = scratch_block();
   buf.clear();
   fill_uniform(buf, info, NoSectionMarks{});

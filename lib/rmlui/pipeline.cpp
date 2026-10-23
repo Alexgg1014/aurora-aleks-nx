@@ -1051,3 +1051,16 @@ uint32_t sampler_mode() noexcept {
 }
 
 } // namespace aurora::rmlui
+
+#if defined(AURORA_GFX_DEKO3D)
+namespace aurora::rmlui {
+// aleks2 (deko3d P1): what lib/deko/dk_rmlui.cpp builds RmlUi's deko3d pipelines from
+std::string_view vertex_wgsl(VertexLayoutKind kind) { return vertex_source(kind); }
+std::string_view fragment_wgsl(PipelineKind kind) { return fragment_source(kind); }
+gfx::BindGroupRef deko3d_common_bind_group() { return common_bind_group_ref(); }
+bool deko3d_group_dynamic(const DrawData& data, uint32_t group) {
+  return group == 0 || (group == 1 && (data.dynamicBindGroupMask & DynamicGroup1) != 0) ||
+         (group == 2 && (data.dynamicBindGroupMask & DynamicGroup2) != 0);
+}
+} // namespace aurora::rmlui
+#endif

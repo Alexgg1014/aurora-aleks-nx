@@ -25,10 +25,20 @@
 #include "../internal.hpp"
 #include "../window.hpp"
 #include "gpu_prof.hpp"
+#include "gpu_timing.hpp"
+
+#include <cstdlib>
 
 #ifdef WEBGPU_DAWN
 #include "../dawn/TracyPlatform.hpp"
 #include <dawn/native/DawnNative.h>
+#endif
+
+#if defined(AURORA_GFX_DEKO3D)
+// aleks2 (deko3d P1): the run-time selectable deko3d renderer (lib/deko)
+#include "../gx/pipeline.hpp"
+#include "dk_aurora.h"
+#include "dk_runtime.hpp"
 #endif
 
 namespace aurora::gx {
@@ -807,6 +817,11 @@ static wgpu::BackendType to_wgpu_backend(AuroraBackend backend) {
 static void release_surface_locked() noexcept { g_surface = {}; }
 
 static bool create_surface() {
+#if defined(AURORA_GFX_DEKO3D)
+  if (gfx::dk::active()) {
+    return true;  // (deko3d P1: no WebGPU surface; lib/deko presents to the default window)
+  }
+#endif
   SDL_Window* window = window::get_sdl_window();
   if (window == nullptr) {
     Log.error("Failed to create surface: no window");
@@ -855,7 +870,23 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
       return false;
     }
   }
+#if defined(AURORA_GFX_DEKO3D)
+  // aleks2 (deko3d P1): the deko3d renderer records Aurora's frames against Dawn's Null device (the
+  // object model) and owns the GPU and the window itself. Two starts in a row that never presented a
+  // frame: this one is Dawn's (the caller tries the next backend).
+  gfx::dk::set_active(false);
+  if (auroraBackend == BACKEND_DEKO3D) {
+    if (!gfx::dk::boot_attempt()) {
+      return false;
+    }
+    gfx::dk::load_options();
+    gfx::dk::set_active(true);
+  }
+  const wgpu::BackendType backend =
+      auroraBackend == BACKEND_DEKO3D ? wgpu::BackendType::Null : to_wgpu_backend(auroraBackend);
+#else
   const wgpu::BackendType backend = to_wgpu_backend(auroraBackend);
+#endif
   Log.info("Attempting to initialize {}", magic_enum::enum_name(backend));
 #if 0
   // D3D12's debug layer is very slow
@@ -996,11 +1027,14 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         }
         requiredFeatures.push_back(feature);
       }
-#ifdef TRACY_ENABLE
+      // aleks2 (V1-c1): gpu_timing needs it without Tracy; nothing is written until a consumer
+      // turns timing on. AURORA_GPU_TIMING=0 (perf-lab.ini gpu_timing=0) leaves it out.
       if (feature == wgpu::FeatureName::TimestampQuery) {
-        requiredFeatures.push_back(feature);
+        const char* env = std::getenv("AURORA_GPU_TIMING");
+        if (env == nullptr || env[0] != '0') {
+          requiredFeatures.push_back(feature);
+        }
       }
-#endif
     }
     std::string featureList;
     for (auto featureName : requiredFeatures) {
@@ -1036,6 +1070,9 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         "disable_symbol_renaming",
         "enable_immediate_error_handling",
         "gl_allow_context_on_multi_threads",
+        // aleks2 (V1-c1): resolve raw timestamps; gpu_timing measures the tick period itself
+        // instead of Dawn compiling a conversion compute shader on the render worker.
+        "disable_timestamp_query_conversion",
     };
     constexpr std::array disableToggles{
         "timestamp_quantization",
@@ -1097,22 +1134,34 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   }
   g_queue = g_device.GetQueue();
 
-  const wgpu::Status status = g_surface.GetCapabilities(g_adapter, &g_surfaceCapabilities);
-  if (status != wgpu::Status::Success) {
-    Log.error("Failed to get surface capabilities: {}", magic_enum::enum_name(status));
-    return false;
+  wgpu::TextureFormat surfaceFormat = wgpu::TextureFormat::Undefined;
+  wgpu::PresentMode presentMode = wgpu::PresentMode::Fifo;
+#if defined(AURORA_GFX_DEKO3D)
+  if (gfx::dk::active()) {
+    // lib/deko: device, queue, memory, swapchain (RGBA8 images, swap interval 1) and the DKSH caches
+    aurora_switch_dk_init(gx::GXPipelineConfigVersion);
+    surfaceFormat = wgpu::TextureFormat::RGBA8Unorm;
+    g_vsyncEnabled.store(g_config.vsync, std::memory_order_release);
+  } else
+#endif
+  {
+    const wgpu::Status status = g_surface.GetCapabilities(g_adapter, &g_surfaceCapabilities);
+    if (status != wgpu::Status::Success) {
+      Log.error("Failed to get surface capabilities: {}", magic_enum::enum_name(status));
+      return false;
+    }
+    if (g_surfaceCapabilities.formatCount == 0) {
+      Log.error("Surface has no formats");
+      return false;
+    }
+    if (g_surfaceCapabilities.presentModeCount == 0) {
+      Log.error("Surface has no present modes");
+      return false;
+    }
+    surfaceFormat = best_surface_format();
+    g_vsyncEnabled.store(g_config.vsync, std::memory_order_release);
+    presentMode = select_present_mode(g_surfaceCapabilities);
   }
-  if (g_surfaceCapabilities.formatCount == 0) {
-    Log.error("Surface has no formats");
-    return false;
-  }
-  if (g_surfaceCapabilities.presentModeCount == 0) {
-    Log.error("Surface has no present modes");
-    return false;
-  }
-  auto surfaceFormat = best_surface_format();
-  g_vsyncEnabled.store(g_config.vsync, std::memory_order_release);
-  auto presentMode = select_present_mode(g_surfaceCapabilities);
   Log.info("Using surface format {}, present mode {}", magic_enum::enum_name(surfaceFormat),
            magic_enum::enum_name(presentMode));
   const auto size = window::get_window_size();
@@ -1132,6 +1181,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   create_copy_pipeline();
   create_resample_pipeline();
   gpu_prof::initialize();
+  gpu_timing::initialize();
   resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
   g_initialized = true;
   return true;
@@ -1140,7 +1190,13 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
 void shutdown() {
   g_initialized = false;
   gfx::gpu_synchronize();
+#if defined(AURORA_GFX_DEKO3D)
+  if (gfx::dk::active()) {
+    aurora_switch_dk_shutdown();
+  }
+#endif
   gpu_prof::shutdown();
+  gpu_timing::shutdown();
   g_CopyBindGroupLayout = {};
   g_CopyPipeline = {};
   g_CopyPremultipliedAlphaPipeline = {};
@@ -1174,9 +1230,158 @@ void release_surface() noexcept {
   }
 }
 
+// aleks2 (V1-c1): render-target sets kept per internal resolution while a pool is wanted
+// (dynamic resolution on, or its stress mode). A step back to a size already visited reuses
+// the textures allocated the first time instead of creating and dropping a set on every
+// change -- the dynamic-resolution history had device memory growing step after step.
+// Pool size 0 (the default) is the previous behaviour exactly: a new set on every change.
+namespace {
+struct RenderTargetSet {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
+  uint32_t samples = 0;
+  TextureWithSampler frameBuffer;
+  TextureWithSampler frameBufferResolved;
+  TextureWithSampler depthBuffer;
+  TextureWithSampler normalBuffer;
+  uint64_t lastUse = 0;
+};
+std::vector<RenderTargetSet> g_rtPool;
+uint32_t g_rtPoolMax = 0;
+uint64_t g_rtUseClock = 0;
+AuroraRenderTargetStats g_rtStats{};
+constexpr uint32_t RenderTargetPoolLimit = 6;
+
+uint64_t rt_set_bytes(uint32_t width, uint32_t height, uint32_t samples, bool normal) {
+  const uint64_t pixels = static_cast<uint64_t>(width) * height;
+  // colour (x samples), resolved colour, depth32 (x samples), normals: 4 bytes a pixel each.
+  return pixels * (4ull * samples + 4ull + 4ull * samples + (normal ? 4ull : 0ull));
+}
+
+RenderTargetSet* rt_current_entry() {
+  for (auto& set : g_rtPool) {
+    if (set.frameBuffer.texture && set.frameBuffer.texture.Get() == g_frameBuffer.texture.Get()) {
+      return &set;
+    }
+  }
+  return nullptr;
+}
+
+void rt_capture_current() {
+  if (!g_frameBuffer.texture) {
+    return;
+  }
+  if (auto* set = rt_current_entry()) {
+    set->frameBufferResolved = g_frameBufferResolved;
+    set->depthBuffer = g_depthBuffer;
+    set->normalBuffer = g_normalBuffer;
+    return;
+  }
+  g_rtPool.push_back(RenderTargetSet{
+      .width = g_frameBuffer.size.width,
+      .height = g_frameBuffer.size.height,
+      .format = g_frameBuffer.format,
+      .samples = g_graphicsConfig.msaaSamples,
+      .frameBuffer = g_frameBuffer,
+      .frameBufferResolved = g_frameBufferResolved,
+      .depthBuffer = g_depthBuffer,
+      .normalBuffer = g_normalBuffer,
+      .lastUse = ++g_rtUseClock,
+  });
+}
+
+void rt_evict_to(uint32_t limit) {
+  while (g_rtPool.size() > limit) {
+    const auto* current = rt_current_entry();
+    auto victim = g_rtPool.end();
+    for (auto it = g_rtPool.begin(); it != g_rtPool.end(); ++it) {
+      if (&*it == current) {
+        continue;
+      }
+      if (victim == g_rtPool.end() || it->lastUse < victim->lastUse) {
+        victim = it;
+      }
+    }
+    if (victim == g_rtPool.end()) {
+      break;
+    }
+    g_rtPool.erase(victim);
+    ++g_rtStats.evictions;
+  }
+}
+
+void rt_refresh_stats() {
+  uint64_t bytes = 0;
+  bool currentCounted = false;
+  for (const auto& set : g_rtPool) {
+    bytes += rt_set_bytes(set.width, set.height, set.samples, static_cast<bool>(set.normalBuffer.texture));
+    currentCounted = currentCounted || set.frameBuffer.texture.Get() == g_frameBuffer.texture.Get();
+  }
+  if (!currentCounted && g_frameBuffer.texture) {
+    bytes += rt_set_bytes(g_frameBuffer.size.width, g_frameBuffer.size.height, g_graphicsConfig.msaaSamples,
+                          static_cast<bool>(g_normalBuffer.texture));
+  }
+  g_rtStats.live_bytes_estimate = bytes;
+  g_rtStats.pool_sets = static_cast<uint32_t>(g_rtPool.size());
+  g_rtStats.pool_max = g_rtPoolMax;
+  g_rtStats.width = g_frameBuffer.size.width;
+  g_rtStats.height = g_frameBuffer.size.height;
+}
+} // namespace
+
+static void assign_render_targets(uint32_t width, uint32_t height) {
+  ++g_rtStats.resizes;
+  const auto format = g_graphicsConfig.surfaceConfiguration.format;
+  const uint32_t samples = g_graphicsConfig.msaaSamples;
+  if (g_rtPoolMax == 0) {
+    g_rtPool.clear();
+    g_frameBuffer = create_render_texture(width, height, true);
+    g_frameBufferResolved = create_render_texture(width, height, false);
+    g_depthBuffer = create_depth_texture(width, height);
+    if (g_graphicsConfig.normalBuffer) {
+      g_normalBuffer = create_normal_texture(width, height);
+    }
+    ++g_rtStats.allocations;
+  } else {
+    rt_capture_current();
+    auto it = std::find_if(g_rtPool.begin(), g_rtPool.end(), [&](const RenderTargetSet& set) {
+      return set.width == width && set.height == height && set.format == format && set.samples == samples;
+    });
+    if (it != g_rtPool.end()) {
+      ++g_rtStats.pool_hits;
+      if (g_graphicsConfig.normalBuffer && !it->normalBuffer.texture) {
+        it->normalBuffer = create_normal_texture(width, height);
+      }
+      it->lastUse = ++g_rtUseClock;
+      g_frameBuffer = it->frameBuffer;
+      g_frameBufferResolved = it->frameBufferResolved;
+      g_depthBuffer = it->depthBuffer;
+      if (g_graphicsConfig.normalBuffer) {
+        g_normalBuffer = it->normalBuffer;
+      }
+    } else {
+      g_frameBuffer = create_render_texture(width, height, true);
+      g_frameBufferResolved = create_render_texture(width, height, false);
+      g_depthBuffer = create_depth_texture(width, height);
+      if (g_graphicsConfig.normalBuffer) {
+        g_normalBuffer = create_normal_texture(width, height);
+      }
+      ++g_rtStats.allocations;
+      rt_capture_current();
+    }
+    rt_evict_to(g_rtPoolMax);
+  }
+  rt_refresh_stats();
+}
+
 static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight,
                                       bool force) {
-  if (!g_surface || !g_device || width == 0 || height == 0 || nativeHeight == 0 || nativeWidth == 0) {
+  bool haveSurface = static_cast<bool>(g_surface);
+#if defined(AURORA_GFX_DEKO3D)
+  haveSurface = haveSurface || gfx::dk::active();  // (lib/deko sizes its own swapchain)
+#endif
+  if (!haveSurface || !g_device || width == 0 || height == 0 || nativeHeight == 0 || nativeWidth == 0) {
     return;
   }
   const bool sizeChanged = g_graphicsConfig.surfaceConfiguration.width != nativeWidth ||
@@ -1196,18 +1401,13 @@ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t 
                               g_graphicsConfig.surfaceConfiguration.height != nativeHeight;
   g_graphicsConfig.surfaceConfiguration.width = nativeWidth;
   g_graphicsConfig.surfaceConfiguration.height = nativeHeight;
-  if (surfaceChanged) {
+  if (surfaceChanged && g_surface) {
     auto surfaceConfiguration = g_graphicsConfig.surfaceConfiguration;
     surfaceConfiguration.device = g_device;
     window::SurfaceLock surfaceLock;
     g_surface.Configure(&surfaceConfiguration);
   }
-  g_frameBuffer = create_render_texture(width, height, true);
-  g_frameBufferResolved = create_render_texture(width, height, false);
-  g_depthBuffer = create_depth_texture(width, height);
-  if (g_graphicsConfig.normalBuffer) {
-    g_normalBuffer = create_normal_texture(width, height);
-  }
+  assign_render_targets(width, height);
   g_CopyBindGroup = create_copy_bind_group(present_source());
 }
 
@@ -1251,6 +1451,11 @@ void resize_swapchain(uint32_t width, uint32_t height, uint32_t nativeWidth, uin
 
 void aurora_enable_vsync(const bool enabled) {
   aurora::webgpu::g_vsyncEnabled.store(enabled, std::memory_order_release);
+#if defined(AURORA_GFX_DEKO3D)
+  if (aurora::gfx::dk::active()) {
+    return;  // (deko3d P1: the swapchain keeps swap interval 1)
+  }
+#endif
   aurora::webgpu::g_graphicsConfig.surfaceConfiguration.presentMode =
       aurora::webgpu::select_present_mode(aurora::webgpu::g_surfaceCapabilities);
   aurora::window::push_custom_event(aurora::window::CustomEvent::RefreshSurface);
@@ -1276,4 +1481,31 @@ void aurora_get_adapter_info(char* backend, size_t backend_size, char* device, s
   copy_info_text(backend, backend_size, backendName.empty() ? std::string_view{"unknown"} : backendName);
   copy_info_text(device, device_size, deviceName.empty() ? std::string_view{"unknown"} : deviceName);
   copy_info_text(driver, driver_size, description.empty() ? std::string_view{"unknown"} : description);
+}
+
+// aleks2 (V1-c1): see the render-target pool above resize_swapchain_internal.
+void aurora_set_render_target_pool(uint32_t max_sets) {
+  using namespace aurora::webgpu;
+  const uint32_t limit = std::min<uint32_t>(max_sets, RenderTargetPoolLimit);
+  if (limit == g_rtPoolMax) {
+    return;
+  }
+  g_rtPoolMax = limit;
+  if (limit == 0) {
+    // The set in use stays in the globals; the others go.
+    const auto evicted = g_rtPool.size() > 0 ? g_rtPool.size() - (rt_current_entry() != nullptr ? 1 : 0) : 0;
+    g_rtStats.evictions += evicted;
+    g_rtPool.clear();
+  } else {
+    rt_capture_current();
+    rt_evict_to(limit);
+  }
+  rt_refresh_stats();
+  Log.info("Render-target pool: {} set(s)", limit);
+}
+
+void aurora_render_target_stats(AuroraRenderTargetStats* out) {
+  if (out != nullptr) {
+    *out = aurora::webgpu::g_rtStats;
+  }
 }

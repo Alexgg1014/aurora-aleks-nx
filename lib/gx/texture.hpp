@@ -23,6 +23,12 @@ struct TextureStats {
 
 const TextureStats& texture_stats() noexcept;
 
+// aleks2 (V1-rc12): every EFB copy's memory range, for the copy-binding counters (aurora_gx_copy_bind_stats). A
+// texture sampled from an address inside a copy but not at its start is not found by copyTextures (keyed by the
+// start address), so it is read from RAM the copy never wrote: the black-ground suspect.
+void note_copy_range(const void* dest, u16 width, u16 height, u32 format, u32 scaledWidth = 0,
+                     u32 scaledHeight = 0) noexcept;
+
 namespace texture {
 constexpr uint64_t ContentCacheBudgetBytes = 128ull * 1024ull * 1024ull;
 constexpr uint64_t ObjectCacheIdleFrames = 600;

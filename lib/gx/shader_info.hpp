@@ -2,6 +2,9 @@
 
 #include "gx.hpp"
 
+#include <atomic>
+#include <cstdint>
+
 namespace aurora::gx {
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept;
 // Fills and pushes the uniform block for the current GX state (the H34 path).
@@ -15,6 +18,17 @@ gfx::Range rebuild_uniform(const ShaderInfo& info, bool pipelineOnly, gfx::Range
 void forget_last_uniform() noexcept;
 // The draw cache dropped its uniform range.
 void invalidate_uniform_reuse() noexcept;
+
+// aleks2 (FIFO-opt): AURORA_FIFO_FAST_* (command_processor.cpp) and their counters.
+// The FIFO thread is the only writer of the counters.
+struct FifoFastCounters {
+  std::atomic<uint64_t> bindMemoHits{0};
+  std::atomic<uint64_t> bindMemoMisses{0};
+  std::atomic<uint64_t> uniformInPlaceBlocks{0};
+  std::atomic<uint64_t> uniformInPlaceRepeats{0};
+};
+extern std::atomic<uint32_t> g_fifoFast;
+extern FifoFastCounters g_fifoFastStats;
 
 namespace testing {
 // Host tests only: clears the tracker and the mismatch latch, which otherwise lasts

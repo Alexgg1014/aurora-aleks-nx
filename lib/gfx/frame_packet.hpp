@@ -37,6 +37,13 @@ struct DrawCommand {
   alignas(std::max_align_t) std::array<std::byte, InlineDrawPayloadSize> payload{};
 };
 
+#if defined(AURORA_GFX_DEKO3D)
+// aleks2 (deko3d P1): the deko3d encoder (lib/deko) replays a draw command by its kind; the payload is
+// a gx::DrawData, a clear::DrawData or an rmlui::DrawData.
+enum class DrawKind : uint8_t { Gx, Clear, Rml, Other };
+DrawKind draw_kind(DrawEncoder encoder) noexcept;
+#endif
+
 enum class CommandType {
   SetViewport,
   SetScissor,

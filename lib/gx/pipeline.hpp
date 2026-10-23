@@ -43,6 +43,20 @@ struct PipelineOptions {
 };
 
 gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout);
+#if defined(AURORA_GFX_DEKO3D)
+// aleks2 (deko3d P1): build_pipeline's fixed state for a pass of a config, the same values it gives
+// Dawn, without creating a WebGPU pipeline (lib/deko/dk_pipeline.cpp)
+struct PipelineStateDesc {
+  bool hasDepth = false;
+  wgpu::DepthStencilState depthStencil;
+  wgpu::BlendState blend;
+  wgpu::PrimitiveState primitive;
+  uint32_t colorCount = 0;
+  std::array<wgpu::ColorWriteMask, gfx::MaxColorAttachments> writeMasks{};
+};
+PipelineStateDesc pipeline_state_desc(const PipelineConfig& config, const gfx::RenderTargetLayout& layout,
+                                      const PipelineOptions& options) noexcept;
+#endif
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 
 void queue_surface(const u8* dlStart, uint32_t dlSize, bool bigEndian) noexcept;

@@ -115,3 +115,15 @@ wgpu::Sampler sampler_ref(const wgpu::SamplerDescriptor& descriptor) {
 }
 
 } // namespace aurora::gfx
+
+#if defined(AURORA_GFX_DEKO3D)
+namespace aurora::gfx {
+// aleks2 (deko3d P1, after SwitchWaker patch 0014): for the deko3d encoder, the cached bind group
+// without a reference (null if expired), valid until the render worker's next expire_cached_bind_groups.
+WGPUBindGroup find_bind_group_raw(BindGroupRef id) {
+  std::lock_guard lock{g_bindGroupCacheMutex};
+  const auto it = g_cachedBindGroups.find(id);
+  return it == g_cachedBindGroups.end() ? nullptr : it->second.bindGroup.Get();
+}
+} // namespace aurora::gfx
+#endif

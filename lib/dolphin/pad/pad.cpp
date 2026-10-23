@@ -3,6 +3,7 @@
 #include "../../internal.hpp"
 #include "../../io.hpp"
 #include <dolphin/pad.h>
+#include <aurora/hd_rumble.h>
 #include <dolphin/si.h>
 #include <SDL3/SDL_mouse.h>
 
@@ -333,6 +334,17 @@ static bool should_use_device_rumble(const u32 port, const aurora::input::GameCo
   return device_rumble_available_for_port(port) &&
          (controller == nullptr ||
           (!controller->m_isGameCube && (!controller->m_hasRumble || controller->m_forceDeviceRumble)));
+}
+
+// aleks2 (V1-rc16): aurora/hd_rumble.h -- HD envelopes go to the console's own controllers only, the same ones the
+// classic rumble reaches through aurora::device; a GameCube adapter (or any pad with rumble of its own) keeps its motor.
+extern "C" bool aurora_hd_rumble_available(const uint32_t chan) {
+#ifdef __SWITCH__
+  return should_use_device_rumble(chan, aurora::input::get_controller_for_player(chan));
+#else
+  (void)chan;
+  return false;
+#endif
 }
 
 static bool device_gyro_available_for_port(const u32 port) {
@@ -708,7 +720,11 @@ static void merge_virtual_status(PADStatus& status, const PADStatus& virtualStat
   status.analogB = std::max(status.analogB, virtualStatus.analogB);
 }
 
+// aleks2 (V1): the input -> present probe (gfx/frame.cpp), observability only
+extern "C" void aurora_latency_note_input(void) noexcept;
+
 u32 PADRead(PADStatus* status) {
+  aurora_latency_note_input();
   if (!g_initialized) {
     Log.fatal("PADRead called before PADInit()!");
   }
@@ -805,7 +821,18 @@ u32 PADRead(PADStatus* status) {
       bool rightTriggerSet = false;
       std::ranges::for_each(controller->m_buttonMapping, [&controller, &i, &status, &leftTriggerSet,
                                                           &rightTriggerSet](const auto& mapping) {
-        if (SDL_GetGamepadButton(controller->m_controller, static_cast<SDL_GamepadButton>(mapping.nativeButton))) {
+        bool pressed = false;
+        if (mapping.nativeButton == PAD_NATIVE_TRIGGER_LEFT || mapping.nativeButton == PAD_NATIVE_TRIGGER_RIGHT) {
+          // A trigger axis as a digital button (PAD_NATIVE_TRIGGER_*). aleks2 (V1): from SwitchWaker v0.5.0
+          // (centollOS/SwitchWaker ee163e8, MIT): a pad whose triggers are only axes (a USB GameCube adapter) can
+          // give one a digital action such as Z.
+          const auto axis = mapping.nativeButton == PAD_NATIVE_TRIGGER_LEFT ? SDL_GAMEPAD_AXIS_LEFT_TRIGGER
+                                                                            : SDL_GAMEPAD_AXIS_RIGHT_TRIGGER;
+          pressed = SDL_GetGamepadAxis(controller->m_controller, axis) > 16000;
+        } else {
+          pressed = SDL_GetGamepadButton(controller->m_controller, static_cast<SDL_GamepadButton>(mapping.nativeButton));
+        }
+        if (pressed) {
           status[i].button |= mapping.padButton;
         }
 

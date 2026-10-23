@@ -21,6 +21,7 @@ struct RawState {
   uint64_t deltaTime = 0;  // as libnx reports it
   float accel[3] = {};     // g
   float gyro[3] = {};      // revolutions per second
+  float dir[9] = {};       // aleks2 (V1-rc12): HID's fused attitude (HidDirectionState, row-major), as given
   bool connected = true;
 };
 
@@ -29,6 +30,7 @@ constexpr uint8_t kGapBefore = 1;  // samples were lost (or skipped) just before
 struct Sample {
   float accel[3] = {};  // m/s^2
   float gyro[3] = {};   // rad/s
+  float dir[9] = {};    // aleks2 (V1-rc12): HID's attitude matrix, as given (row-major)
   uint64_t samplingNumber = 0;
   uint32_t deltaUs = 0;  // microseconds this sample covers, always within kMinUs..kMaxUs
   uint8_t flags = 0;
@@ -132,6 +134,9 @@ inline int ingest(Cursor& c, const RawState* states, int got, Sample* out, int m
     for (int k = 0; k < 3; ++k) {
       o.accel[k] = s.accel[k] * kGToMetresPerSecSq;
       o.gyro[k] = s.gyro[k] * kRevToRad;
+    }
+    for (int k = 0; k < 9; ++k) {
+      o.dir[k] = s.dir[k];
     }
     o.samplingNumber = s.samplingNumber;
     o.deltaUs = period_us(s.deltaTime, step, &c.timing);

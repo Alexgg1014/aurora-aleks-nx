@@ -46,5 +46,8 @@ uint32_t current_frame() noexcept;
 void after_submit() noexcept;
 void gpu_synchronize();
 void after_present() noexcept;
+// aleks2 (V1): the input -> present probe (frame.cpp): the first PADRead of the frame being ended, then its present
+int64_t latency_take_input() noexcept;
+void latency_note_presented(int64_t inputNs) noexcept;
 float calculate_fps() noexcept;
 } // namespace aurora::gfx

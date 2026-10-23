@@ -1,3 +1,4 @@
+#include <aurora/tuning.h>
 #include "resources.hpp"
 #include "recording.hpp"
 
@@ -320,6 +321,14 @@ wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept {
     minLod = 0.f;
     maxLod = 0.f;
   }
+  // aleks2 (V1-rc12): debug switches for the black-ground bisect (tuning.h).
+  if ((aurora_debug_flags() & AURORA_DEBUG_BASE_MIP) != 0) {
+    minLod = 0.f;
+    maxLod = 0.f;
+  }
+  if ((aurora_debug_flags() & AURORA_DEBUG_NO_ANISO) != 0) {
+    maxAnisotropy = 1;
+  }
   if ((ref && ref->hasArbitraryMips) || !mipsEnabled) {
     maxAnisotropy = 1;
   } else if (maxAnisotropy > 1) {
@@ -341,3 +350,8 @@ wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept {
   };
 }
 } // namespace aurora::gfx
+
+// aleks2 (V1-rc12): see aurora_debug_set_flags (tuning.h).
+static uint32_t s_auroraDebugFlags = 0;
+extern "C" void aurora_debug_set_flags(uint32_t flags) { s_auroraDebugFlags = flags; }
+extern "C" uint32_t aurora_debug_flags(void) { return s_auroraDebugFlags; }

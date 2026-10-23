@@ -25,6 +25,10 @@
 #include <vector>
 
 #include <tracy/Tracy.hpp>
+#if defined(AURORA_GFX_DEKO3D)
+#include "dk_gfx.hpp"
+#include "dk_runtime.hpp"
+#endif
 
 namespace aurora::gfx {
 using namespace detail;
@@ -406,6 +410,13 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
 
 namespace detail {
 void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
+#if defined(AURORA_GFX_DEKO3D)
+  if (dk::active()) {
+    // aleks2 (deko3d P1): the op's uploads and commands go to deko3d (lib/deko), no staging copies
+    dk::encode_op(frame, op);
+    return;
+  }
+#endif
   copy_staging_to_high_water(cmd, frame, op);
   switch (op.type) {
   case FrameOpType::RenderPass:

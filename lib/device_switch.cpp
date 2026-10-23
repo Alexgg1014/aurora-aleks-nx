@@ -8,16 +8,24 @@
 #include <switch.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <vector>
+
+#include <aurora/hd_rumble.h>
 
 #include "device.hpp"
+#include "logging.hpp"
 #include "motion_queue.hpp"
+#include "player_one_rule.hpp"
 
 namespace aurora::device {
 namespace {
+
+constexpr Module Log{"aurora::device"};
 
 PadState s_pad{};
 bool s_padInitialized = false;
@@ -56,20 +64,173 @@ bool choose_style(u32 styleSet, HidNpadStyleTag& outStyle) {
   return false;
 }
 
-bool resolve_handle(HidSixAxisSensorHandle& outHandle) {
-  ensure_pad();
-  padUpdate(&s_pad);
+// ---------------------------------------------------------------------------
+// aleks2 (rc17 console bug): the npad that is player 1.
+//
+// The game's pad 0 is SDL's one Switch joystick, which reads Handheld and No1 together (padInitializeDefault). So
+// both drive player 1, and vibration and six-axis must go to the one in use. rc16 took Handheld whenever the
+// Joy-Con were attached: with a DualSense on No1 (MissionControl, seen as a Pro Controller) and the Joy-Con on the
+// console, HD Rumble buzzed the Joy-Con and gyro aim read a console lying still.
+//
+// The rule: an npad that is connected on its own wins. When both are connected, the one that last had input (a
+// button press or a stick off-centre) wins; until one does, No1 (an external controller was connected for a
+// reason). player_one_track() follows this every frame (aurora_player_one_tick); everything below asks
+// player_one().
+PadState s_padNo1{};
+PadState s_padHandheld{};
+bool s_routeInit = false;
+bool s_p1Known = false;
+HidNpadIdType s_p1Id = HidNpadIdType_No1;
 
-  HidNpadIdType id = HidNpadIdType_No1;
-  HidNpadStyleTag style = static_cast<HidNpadStyleTag>(0);
-  if (padIsHandheld(&s_pad)) {
-    id = HidNpadIdType_Handheld;
-    style = HidNpadStyleTag_NpadHandheld;
-  } else if (padIsNpadActive(&s_pad, HidNpadIdType_No1)) {
-    if (!choose_style(hidGetNpadStyleSet(HidNpadIdType_No1), style)) {
+bool npad_style(const HidNpadIdType id, HidNpadStyleTag& style) {
+  const u32 set = hidGetNpadStyleSet(id);
+  if (id == HidNpadIdType_Handheld) {
+    if ((set & HidNpadStyleTag_NpadHandheld) == 0) {
       return false;
     }
-  } else {
+    style = HidNpadStyleTag_NpadHandheld;
+    return true;
+  }
+  return choose_style(set, style);
+}
+
+bool had_input(PadState& pad) {
+  padUpdate(&pad);
+  if (padGetButtonsDown(&pad) != 0) {
+    return true;
+  }
+  constexpr s32 kOffCentre = 9000;  // of 32767: a stick deliberately pushed, not drift
+  for (int stick = 0; stick < 2; ++stick) {
+    const HidAnalogStickState s = padGetStickPos(&pad, stick);
+    if (s.x > kOffCentre || s.x < -kOffCentre || s.y > kOffCentre || s.y < -kOffCentre) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const char* style_name(const HidNpadStyleTag style) {
+  switch (style) {
+  case HidNpadStyleTag_NpadFullKey: return "Pro/FullKey";
+  case HidNpadStyleTag_NpadHandheld: return "Handheld";
+  case HidNpadStyleTag_NpadJoyDual: return "JoyDual";
+  case HidNpadStyleTag_NpadJoyLeft: return "JoyLeft";
+  case HidNpadStyleTag_NpadJoyRight: return "JoyRight";
+  default: return "?";
+  }
+}
+
+void player_one_track() {
+  ensure_pad();
+  if (!s_routeInit) {
+    padInitialize(&s_padNo1, HidNpadIdType_No1);
+    padInitialize(&s_padHandheld, HidNpadIdType_Handheld);
+    s_routeInit = true;
+  }
+  using player_one_rule::Npad;
+  HidNpadStyleTag style{};
+  player_one_rule::Seen seen;
+  seen.no1Connected = npad_style(HidNpadIdType_No1, style);
+  seen.handheldConnected = npad_style(HidNpadIdType_Handheld, style);
+  seen.no1Input = had_input(s_padNo1);
+  seen.handheldInput = had_input(s_padHandheld);
+  const bool no1 = seen.no1Connected;
+  const bool handheld = seen.handheldConnected;
+  const Npad previous = !s_p1Known ? Npad::None : s_p1Id == HidNpadIdType_Handheld ? Npad::Handheld : Npad::No1;
+  const Npad pick = player_one_rule::choose(seen, previous);
+  if (pick == Npad::None) {
+    s_p1Known = false;
+    return;
+  }
+  const HidNpadIdType chosen = pick == Npad::Handheld ? HidNpadIdType_Handheld : HidNpadIdType_No1;
+  if (!s_p1Known || chosen != s_p1Id) {
+    HidNpadStyleTag chosenStyle{};
+    npad_style(chosen, chosenStyle);
+    Log.info("player 1 is npad {} ({}){}", chosen == HidNpadIdType_Handheld ? "Handheld" : "No1",
+             style_name(chosenStyle), no1 && handheld ? "; the other one is connected too" : "");
+  }
+  s_p1Id = chosen;
+  s_p1Known = true;
+}
+
+// The npad and style that vibration and six-axis go to.
+bool player_one(HidNpadIdType& id, HidNpadStyleTag& style) {
+  if (!s_p1Known) {
+    player_one_track();
+    if (!s_p1Known) {
+      return false;
+    }
+  }
+  id = s_p1Id;
+  if (npad_style(id, style)) {
+    return true;
+  }
+  // It went away since the last tick (undocked, a controller switched off): look again now.
+  player_one_track();
+  if (!s_p1Known) {
+    return false;
+  }
+  id = s_p1Id;
+  return npad_style(id, style);
+}
+
+// aleks2 (rc17): a sensor that gives no motion data at all -- common for non-Nintendo pads behind MissionControl,
+// which take the Pro Controller's place without its six-axis -- is noted per npad and style. gyro_available() is
+// then false for it, so the game keeps the classic controls; the gyro setting stays as the player set it. The
+// reason goes to the log once. When another controller becomes player 1, its sensor is tried afresh.
+constexpr auto kMotionGrace = std::chrono::milliseconds{1500};
+bool s_motionSeen = false;
+bool s_noMotion = false;
+HidNpadIdType s_noMotionId = HidNpadIdType_No1;
+HidNpadStyleTag s_noMotionStyle{};
+std::chrono::steady_clock::time_point s_motionSince{};
+
+void note_motion(const bool connected, const HidSixAxisSensorState& state) {
+  if (s_motionSeen || s_noMotion) {
+    return;
+  }
+  // A working sensor always shows gravity; one that answers with zeros, or not at all, has nothing.
+  const HidVector& a = state.acceleration;
+  if (connected && (a.x != 0.0f || a.y != 0.0f || a.z != 0.0f)) {
+    s_motionSeen = true;
+    return;
+  }
+  if (std::chrono::steady_clock::now() - s_motionSince < kMotionGrace) {
+    return;
+  }
+  HidNpadIdType id{};
+  HidNpadStyleTag style{};
+  if (!player_one(id, style)) {
+    return;
+  }
+  s_noMotion = true;
+  s_noMotionId = id;
+  s_noMotionStyle = style;
+  Log.warn("gyro: player 1 (npad {}, {}) gives no motion data{}; gyro aim falls back to the classic controls",
+           id == HidNpadIdType_Handheld ? "Handheld" : "No1", style_name(style),
+           connected ? " (all zero)" : " (sensor not connected)");
+}
+
+bool no_motion_for_player_one() {
+  if (!s_noMotion) {
+    return false;
+  }
+  HidNpadIdType id{};
+  HidNpadStyleTag style{};
+  if (!player_one(id, style)) {
+    return true;
+  }
+  if (id == s_noMotionId && style == s_noMotionStyle) {
+    return true;
+  }
+  s_noMotion = false;  // another controller is player 1 now: try its sensor
+  return false;
+}
+
+bool resolve_handle(HidSixAxisSensorHandle& outHandle) {
+  HidNpadIdType id = HidNpadIdType_No1;
+  HidNpadStyleTag style = static_cast<HidNpadStyleTag>(0);
+  if (!player_one(id, style)) {
     return false;
   }
 
@@ -107,6 +268,9 @@ bool ensure_started() {
       return false;
     }
     s_started = true;
+    // aleks2 (rc17): a newly started sensor gets its grace period to show motion data.
+    s_motionSeen = false;
+    s_motionSince = std::chrono::steady_clock::now();
   }
   return true;
 }
@@ -120,8 +284,10 @@ bool read(bool gyro, float* data, const int n_values) {
     return false;
   }
   HidSixAxisSensorState state{};
-  if (hidGetSixAxisSensorStates(s_handle, &state, 1) == 0 ||
-      (state.attributes & HidSixAxisSensorAttribute_IsConnected) == 0) {
+  const bool got = hidGetSixAxisSensorStates(s_handle, &state, 1) != 0;
+  const bool connected = got && (state.attributes & HidSixAxisSensorAttribute_IsConnected) != 0;
+  note_motion(connected, state);  // aleks2 (rc17)
+  if (!connected) {
     return false;
   }
   // UNITS. libnx and SDL do not agree, and everything downstream is tuned for
@@ -179,13 +345,8 @@ void stop_side(SideSensor& s) {
 constexpr float kGToMetresPerSecSq = 9.80665f;
 
 bool detached_pair_style(HidNpadIdType& id, HidNpadStyleTag& style) {
-  ensure_pad();
-  padUpdate(&s_pad);
-  if (padIsHandheld(&s_pad) || !padIsNpadActive(&s_pad, HidNpadIdType_No1)) {
-    return false;
-  }
-  id = HidNpadIdType_No1;
-  if (!choose_style(hidGetNpadStyleSet(HidNpadIdType_No1), style)) {
+  // aleks2 (rc17): player 1's npad, not "No1 unless the console has Joy-Con attached".
+  if (!player_one(id, style)) {
     return false;
   }
   return style == HidNpadStyleTag_NpadJoyDual;
@@ -197,10 +358,9 @@ SensorLayout layout(const bool start) {
   HidNpadIdType id = HidNpadIdType_No1;
   HidNpadStyleTag style = static_cast<HidNpadStyleTag>(0);
   if (!detached_pair_style(id, style)) {
-    ensure_pad();
-    // Handheld, Pro Controller or a lone Joy-Con: one sensor, Primary.
-    out.primary = padIsHandheld(&s_pad) ||
-                  (padIsNpadActive(&s_pad, HidNpadIdType_No1) && hidGetNpadStyleSet(HidNpadIdType_No1) != 0);
+    // Handheld, Pro Controller or a lone Joy-Con: one sensor, Primary. aleks2 (rc17): none when player 1's
+    // controller gives no motion data.
+    out.primary = player_one(id, style) && !no_motion_for_player_one();
     for (auto& s : s_side) {
       stop_side(s);
     }
@@ -253,6 +413,11 @@ int read_motion(const HidSixAxisSensorHandle handle, motion::Cursor& cursor, Mot
     raw[i].gyro[0] = states[i].angular_velocity.x;
     raw[i].gyro[1] = states[i].angular_velocity.y;
     raw[i].gyro[2] = states[i].angular_velocity.z;
+    for (int r = 0; r < 3; ++r) {
+      for (int c = 0; c < 3; ++c) {
+        raw[i].dir[r * 3 + c] = states[i].direction.direction[r][c];
+      }
+    }
     raw[i].connected = (states[i].attributes & HidSixAxisSensorAttribute_IsConnected) != 0;
   }
   motion::Sample ready[kQueue];
@@ -262,9 +427,12 @@ int read_motion(const HidSixAxisSensorHandle handle, motion::Cursor& cursor, Mot
       out[i].accel[k] = ready[i].accel[k];
       out[i].gyro[k] = ready[i].gyro[k];
     }
+    for (int k = 0; k < 9; ++k) {
+      out[i].dir[k] = ready[i].dir[k];
+    }
     out[i].sampling_number = ready[i].samplingNumber;
     out[i].delta_us = ready[i].deltaUs;
-    out[i].flags = ready[i].flags;
+    out[i].flags = ready[i].flags | kMotionHasDirection;
   }
   return n;
 }
@@ -302,49 +470,161 @@ HidNpadIdType s_motorId = HidNpadIdType_No1;
 HidNpadStyleTag s_motorStyle = static_cast<HidNpadStyleTag>(0);
 bool s_motorsReady = false;
 
+// aleks2 (V1-rc16): the intensity setting, applied to everything sent to the motors.
+std::atomic<float> s_rumbleGain{1.0f};
+
 // Callers hold s_rumbleMutex.
 void send_motors(const float ampLow, const float ampHigh) {
   if (!s_motorsReady) {
     return;
   }
+  const float gain = s_rumbleGain.load(std::memory_order_relaxed);
   HidVibrationValue values[2]{};
   for (s32 i = 0; i < s_motorCount; i++) {
-    values[i].amp_low = ampLow;
+    values[i].amp_low = ampLow * gain;
     values[i].freq_low = kMotorFreqLow;
-    values[i].amp_high = ampHigh;
+    values[i].amp_high = ampHigh * gain;
     values[i].freq_high = kMotorFreqHigh;
   }
   hidSendVibrationValues(s_motors, values, s_motorCount);
 }
 
-// Game thread only: it calls padUpdate, which the worker never does.
-bool resolve_motors() {
-  ensure_pad();
-  padUpdate(&s_pad);
+// aleks2 (V1-rc16): HD Rumble (aurora/hd_rumble.h). Two layers of keyframes, played by the rumble worker.
+struct HdLayer {
+  std::vector<AuroraHdKey> keys;
+  bool loop = false;
+  bool active = false;
+  std::chrono::steady_clock::time_point start{};
+  uint32_t totalMs = 0;
+};
+HdLayer s_hd[2];
+bool s_hdSent = false;  // the last thing sent was an HD value (so the end sends one stop)
 
-  HidNpadIdType id = HidNpadIdType_No1;
-  HidNpadStyleTag style = static_cast<HidNpadStyleTag>(0);
-  if (padIsHandheld(&s_pad)) {
-    id = HidNpadIdType_Handheld;
-    style = HidNpadStyleTag_NpadHandheld;
-  } else if (padIsNpadActive(&s_pad, HidNpadIdType_No1)) {
-    if (!choose_style(hidGetNpadStyleSet(HidNpadIdType_No1), style)) {
+// The layer's value at `now`, or false when it has ended. Callers hold s_rumbleMutex.
+bool hd_eval(HdLayer& layer, const std::chrono::steady_clock::time_point now, AuroraHdKey& out) {
+  if (!layer.active || layer.keys.empty() || layer.totalMs == 0) {
+    layer.active = false;
+    return false;
+  }
+  uint32_t t = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now - layer.start).count());
+  if (t >= layer.totalMs) {
+    if (!layer.loop) {
+      layer.active = false;
       return false;
     }
-  } else {
+    t %= layer.totalMs;
+  }
+  for (size_t i = 0; i < layer.keys.size(); ++i) {
+    const AuroraHdKey& a = layer.keys[i];
+    if (t < a.ms) {
+      // towards the next key (the last one holds, or eases towards the first when looping)
+      const bool last = i + 1 == layer.keys.size();
+      const AuroraHdKey& b = last ? (layer.loop ? layer.keys.front() : a) : layer.keys[i + 1];
+      const float f = a.ms == 0 ? 0.0f : static_cast<float>(t) / static_cast<float>(a.ms);
+      out.amp_low = a.amp_low + (b.amp_low - a.amp_low) * f;
+      out.freq_low = a.freq_low + (b.freq_low - a.freq_low) * f;
+      out.amp_high = a.amp_high + (b.amp_high - a.amp_high) * f;
+      out.freq_high = a.freq_high + (b.freq_high - a.freq_high) * f;
+      out.pan = a.pan + (b.pan - a.pan) * f;
+      return true;
+    }
+    t -= a.ms;
+  }
+  return false;
+}
+
+// One side of the pad from a band value and its balance.
+float side_amp(const float amp, const float pan, const bool right) {
+  return std::clamp(amp * (right ? std::min(1.0f, 1.0f + pan) : std::min(1.0f, 1.0f - pan)), 0.0f, 1.0f);
+}
+
+// Callers hold s_rumbleMutex. Each band takes the stronger layer; a lone Joy-Con gets both sides at once.
+void send_hd(const AuroraHdKey* const layers[2]) {
+  if (!s_motorsReady) {
+    return;
+  }
+  const float gain = s_rumbleGain.load(std::memory_order_relaxed);
+  const bool single = s_motorCount == 1;
+  HidVibrationValue values[2]{};
+  for (s32 m = 0; m < s_motorCount; ++m) {
+    float ampLow = 0.0f, ampHigh = 0.0f, freqLow = kMotorFreqLow, freqHigh = kMotorFreqHigh;
+    for (int l = 0; l < 2; ++l) {
+      const AuroraHdKey* k = layers[l];
+      if (k == nullptr) {
+        continue;
+      }
+      const float low = single ? k->amp_low : side_amp(k->amp_low, k->pan, m == 1);
+      const float high = single ? k->amp_high : side_amp(k->amp_high, k->pan, m == 1);
+      if (low > ampLow) {
+        ampLow = low;
+        freqLow = k->freq_low;
+      }
+      if (high > ampHigh) {
+        ampHigh = high;
+        freqHigh = k->freq_high;
+      }
+    }
+    values[m].amp_low = ampLow * gain;
+    values[m].freq_low = std::clamp(freqLow, 40.0f, 640.0f);
+    values[m].amp_high = ampHigh * gain;
+    values[m].freq_high = std::clamp(freqHigh, 80.0f, 1280.0f);
+  }
+  hidSendVibrationValues(s_motors, values, s_motorCount);
+  s_hdSent = true;
+}
+
+// Callers hold s_rumbleMutex. True while a layer still plays.
+bool hd_step(const std::chrono::steady_clock::time_point now) {
+  AuroraHdKey values[2]{};
+  const AuroraHdKey* layers[2]{};
+  bool any = false;
+  for (int l = 0; l < 2; ++l) {
+    if (hd_eval(s_hd[l], now, values[l])) {
+      layers[l] = &values[l];
+      any = true;
+    }
+  }
+  if (any) {
+    send_hd(layers);
+  } else if (s_hdSent) {
+    send_motors(0.0f, 0.0f);
+    s_hdSent = false;
+  }
+  return any;
+}
+
+// Game thread only: it calls padUpdate, which the worker never does.
+bool resolve_motors() {
+  // aleks2 (rc17): player 1's npad and style (Pro/FullKey, JoyDual, Handheld, JoyLeft/Right), never "Handheld
+  // whenever the Joy-Con are attached".
+  HidNpadIdType id = HidNpadIdType_No1;
+  HidNpadStyleTag style = static_cast<HidNpadStyleTag>(0);
+  if (!player_one(id, style)) {
     return false;
   }
 
   if (s_motorsReady && id == s_motorId && style == s_motorStyle) {
     return true;
   }
+  if (s_motorsReady) {
+    // Player 1 changed: the controller left behind must not keep buzzing.
+    std::lock_guard lock{s_rumbleMutex};
+    send_motors(0.0f, 0.0f);
+    s_motorsReady = false;
+  }
   // A lone Joy-Con has one motor; handheld, Pro and dual have two.
   const s32 count =
       (style == HidNpadStyleTag_NpadJoyLeft || style == HidNpadStyleTag_NpadJoyRight) ? 1 : 2;
-  if (R_FAILED(hidInitializeVibrationDevices(s_motors, count, id, style))) {
+  HidVibrationDeviceHandle motors[2]{};
+  const bool ok = R_SUCCEEDED(hidInitializeVibrationDevices(motors, count, id, style));
+  // aleks2 (V1-rc16): the worker sends HD values from these handles, so they change under its lock.
+  std::lock_guard lock{s_rumbleMutex};
+  if (!ok) {
     s_motorsReady = false;
     return false;
   }
+  s_motors[0] = motors[0];
+  s_motors[1] = motors[1];
   s_motorCount = count;
   s_motorId = id;
   s_motorStyle = style;
@@ -355,6 +635,13 @@ bool resolve_motors() {
 void rumble_worker() {
   std::unique_lock lock{s_rumbleMutex};
   while (!s_rumbleQuit) {
+    // aleks2 (V1-rc16): an HD envelope plays at ~5 ms steps and takes precedence over a timed pulse.
+    if (s_hd[0].active || s_hd[1].active || s_hdSent) {
+      if (hd_step(std::chrono::steady_clock::now())) {
+        s_rumbleWake.wait_for(lock, std::chrono::milliseconds{5});
+      }
+      continue;
+    }
     if (!s_rumblePulsing) {
       s_rumbleWake.wait(lock);
       continue;
@@ -377,7 +664,8 @@ void ensure_rumble_worker() {
 
 bool gyro_available(const SensorSide side) noexcept {
   const SideSensor* s = side_sensor(side);
-  return s == nullptr ? true : (s->resolved && s->started);
+  // aleks2 (rc17): Primary is unavailable while player 1's controller gives no motion data (classic controls).
+  return s == nullptr ? !no_motion_for_player_one() : (s->resolved && s->started);
 }
 bool gyro(const SensorSide side, float* data, const int n_values) noexcept {
   SideSensor* s = side_sensor(side);
@@ -440,10 +728,16 @@ int motion_samples(const SensorSide side, MotionSample* out, const int max_sampl
     return read_motion(s->handle, s->cursor, out, max_samples);
   }
   // Primary: the sensor read() uses; this call keeps its own cursor over the same (read-only) state queue.
-  if (!ensure_started()) {
+  if (no_motion_for_player_one() || !ensure_started()) {
     return 0;
   }
-  return read_motion(s_handle, s_primaryCursor, out, max_samples);
+  const int n = read_motion(s_handle, s_primaryCursor, out, max_samples);
+  if (!s_motionSeen && !s_noMotion) {  // aleks2 (rc17): the no-motion check, as read() does it
+    HidSixAxisSensorState state{};
+    const bool got = hidGetSixAxisSensorStates(s_handle, &state, 1) != 0;
+    note_motion(got && (state.attributes & HidSixAxisSensorAttribute_IsConnected) != 0, state);
+  }
+  return n;
 }
 
 bool motion_stats(const SensorSide side, MotionStats* out) noexcept {
@@ -555,4 +849,65 @@ void shutdown_rumble() noexcept {
 }  // namespace detail
 
 }  // namespace aurora::device
+
+// aleks2 (V1-rc16): aurora/hd_rumble.h. aurora_hd_rumble_available() lives in dolphin/pad/pad.cpp (it needs the
+// pad's controller); the rest is here.
+extern "C" void aurora_hd_rumble_play(const int layer, const AuroraHdKey* keys, const int count, const bool loop) {
+  using namespace aurora::device;
+  if (layer < 0 || layer > 1) {
+    return;
+  }
+  if (count > 0 && !resolve_motors()) {
+    return;
+  }
+  {
+    std::lock_guard lock{s_rumbleMutex};
+    HdLayer& l = s_hd[layer];
+    l.keys.assign(keys, keys + std::max(count, 0));
+    l.loop = loop;
+    l.totalMs = 0;
+    for (const auto& k : l.keys) {
+      l.totalMs += k.ms;
+    }
+    l.start = std::chrono::steady_clock::now();
+    l.active = !l.keys.empty() && l.totalMs != 0;
+    s_rumblePulsing = false;  // a classic timed pulse gives way
+  }
+  ensure_rumble_worker();
+  s_rumbleWake.notify_one();
+}
+
+extern "C" void aurora_hd_rumble_stop(void) {
+  using namespace aurora::device;
+  std::lock_guard lock{s_rumbleMutex};
+  s_hd[0].active = s_hd[1].active = false;
+  if (s_hdSent) {
+    send_motors(0.0f, 0.0f);
+    s_hdSent = false;
+  }
+  s_rumbleWake.notify_one();
+}
+
+extern "C" void aurora_rumble_set_gain(const float gain) {
+  aurora::device::s_rumbleGain.store(std::clamp(gain, 0.0f, 1.0f), std::memory_order_relaxed);
+}
+
+// aleks2 (rc17): which npad is player 1, followed once per frame (game thread). A change also moves the motors
+// right away, so a loop that is playing (a quake, a gallop) continues on the new controller and the old one stops.
+extern "C" void aurora_player_one_tick(void) {
+  using namespace aurora::device;
+  const bool known = s_p1Known;
+  const HidNpadIdType before = s_p1Id;
+  player_one_track();
+  if (!s_motorsReady || (known && s_p1Known && s_p1Id == before)) {
+    return;
+  }
+  if (!s_p1Known) {
+    std::lock_guard lock{s_rumbleMutex};
+    send_motors(0.0f, 0.0f);
+    s_motorsReady = false;
+    return;
+  }
+  resolve_motors();
+}
 #endif

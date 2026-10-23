@@ -35,9 +35,11 @@ int accel_samples(SensorSide side, float* xyz, int max_samples) noexcept;
 // state queue: it hands out the states since its last call, oldest first, and remembers where it stopped, so a second
 // reader would find nothing. accel_samples() below does not read that queue: it returns the latest acceleration only.
 constexpr uint8_t kMotionGapBefore = 1;  // MotionSample::flags: states were lost (or skipped) just before this sample
+constexpr uint8_t kMotionHasDirection = 2;  // aleks2 (V1-rc12): MotionSample::dir holds HID's attitude
 struct MotionSample {
   float accel[3] = {};  // m/s^2, gravity included
   float gyro[3] = {};   // rad/s
+  float dir[9] = {};    // aleks2 (V1-rc12): HID's fused attitude (3x3, row-major) when kMotionHasDirection is set
   uint64_t sampling_number = 0;
   uint32_t delta_us = 0;  // microseconds this sample covers; 0 when the backend does not know (SDL: latest sample only)
   uint8_t flags = 0;

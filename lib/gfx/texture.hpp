@@ -11,6 +11,12 @@ struct TextureUpload {
   wgpu::TexelCopyTextureInfo tex;
   wgpu::Extent3D size;
   wgpu::Buffer buffer;
+#if defined(AURORA_GFX_DEKO3D)
+  // aleks2 (deko3d P1): with the deko3d renderer, an upload larger than the frame's staging is in
+  // deko3d memory of its own (a DkMemBlock and its GPU address; lib/deko frees it)
+  void* dkBlock = nullptr;
+  uint64_t dkGpu = 0;
+#endif
 
   TextureUpload(wgpu::TexelCopyBufferLayout layout, wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size) noexcept
   : layout(layout), tex(std::move(tex)), size(size) {}

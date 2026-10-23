@@ -86,6 +86,8 @@ bool is_worker_thread() noexcept;
 // aleks2 (H35): items run on the worker and the time spent running them, since launch.
 uint64_t items_run() noexcept;
 uint64_t work_ns() noexcept;
+// aleks2 (deko3d P1): the worker thread's CPU time (thread ticks; 0 off the Switch), sampled at each end of frame
+uint64_t thread_cpu_ns() noexcept;
 bool is_idle() noexcept;
 
 } // namespace aurora::gfx::render_worker

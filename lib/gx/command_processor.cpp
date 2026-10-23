@@ -14,6 +14,9 @@
 #include "../gfx/hash.hpp"
 #include "../gfx/pipeline_cache.hpp"
 #include "lookup_memo.hpp"
+#include "index_gen.hpp"
+#include <bit>
+#include <memory>
 #include <aurora/tuning.h>
 
 #include <tracy/Tracy.hpp>
@@ -35,7 +38,29 @@ constexpr uint32_t kMemoKindGx = 1;
 std::atomic_bool g_pipelineMemoEnabled{true};
 LookupMemo<PipelineConfig, gfx::PipelineRef, ShaderInfo, 256, 4> g_pipelineMemo;
 } // namespace
+
+// aleks2 (FIFO-opt): the fast-path switches (AURORA_FIFO_FAST_*) and their counters.
+// Only the FIFO thread writes the counters (plain load/store, as the uniform ones).
+std::atomic<uint32_t> g_fifoFast{0};
+FifoFastCounters g_fifoFastStats;
 } // namespace aurora::gx
+
+extern "C" void aurora_gx_set_fifo_fast(uint32_t mask) {
+  aurora::gx::g_fifoFast.store(mask & AURORA_FIFO_FAST_ALL, std::memory_order_relaxed);
+}
+
+extern "C" uint32_t aurora_gx_get_fifo_fast(void) { return aurora::gx::g_fifoFast.load(std::memory_order_relaxed); }
+
+extern "C" void aurora_gx_fifo_fast_stats(AuroraFifoFastStats* out) {
+  if (out == nullptr) {
+    return;
+  }
+  const auto& c = aurora::gx::g_fifoFastStats;
+  out->bind_memo_hits = c.bindMemoHits.load(std::memory_order_relaxed);
+  out->bind_memo_misses = c.bindMemoMisses.load(std::memory_order_relaxed);
+  out->uniform_in_place_blocks = c.uniformInPlaceBlocks.load(std::memory_order_relaxed);
+  out->uniform_in_place_repeats = c.uniformInPlaceRepeats.load(std::memory_order_relaxed);
+}
 
 extern "C" void aurora_gx_set_pipeline_memo(bool enabled) {
   aurora::gx::g_pipelineMemoEnabled.store(enabled, std::memory_order_relaxed);
@@ -430,6 +455,37 @@ static u32 calc_vtx_size(GXVtxFmt fmt) noexcept {
 
 using LayoutKey = decltype(gfx::get_render_target_layout().key);
 
+// aleks2 (FIFO-opt, PIPELINE_HASH / PIPELINE_COMPARE): the TEV stages past tevStageCount.
+// populate_pipeline_config writes stages [0, count) into a value-initialised config, so
+// in every config it builds (and in cache.config, always one of them) the stages past the
+// count hold the same default bytes. Hashing or comparing without them gives the same
+// answer for these configs, at a fraction of the 2112 bytes the 16 stages take.
+constexpr size_t kTevStagesBegin = offsetof(PipelineConfig, shaderConfig) + offsetof(ShaderConfig, tevStages);
+constexpr size_t kTevStagesEnd = offsetof(PipelineConfig, shaderConfig) + offsetof(ShaderConfig, tevStageCount);
+static_assert(kTevStagesEnd - kTevStagesBegin == sizeof(TevStage) * MaxTevStages);
+
+static size_t active_stages_end(const PipelineConfig& config) noexcept {
+  const u32 count = std::min<u32>(config.shaderConfig.tevStageCount, MaxTevStages);
+  return kTevStagesBegin + count * sizeof(TevStage);
+}
+
+static uint64_t pipeline_hash_active(const PipelineConfig& config) noexcept {
+  const auto* bytes = reinterpret_cast<const uint8_t*>(&config);
+  const uint64_t head = xxh3_hash_s(bytes, active_stages_end(config));
+  return xxh3_hash_s(bytes + kTevStagesEnd, sizeof(PipelineConfig) - kTevStagesEnd, head);
+}
+
+static bool pipeline_equal_active(const PipelineConfig& a, const PipelineConfig& b) noexcept {
+  const size_t end = active_stages_end(a);
+  if (end != active_stages_end(b)) {
+    return false; // different stage counts
+  }
+  const auto* pa = reinterpret_cast<const uint8_t*>(&a);
+  const auto* pb = reinterpret_cast<const uint8_t*>(&b);
+  return std::memcmp(pa, pb, end) == 0 &&
+         std::memcmp(pa + kTevStagesEnd, pb + kTevStagesEnd, sizeof(PipelineConfig) - kTevStagesEnd) == 0;
+}
+
 // Makes the cached pipeline (its configuration, shader analysis and handle) the one the
 // current GX state asks for.
 static void refresh_pipeline(DrawCache& cache, GXPrimitive prim, GXVtxFmt fmt, u8 lineMode,
@@ -445,10 +501,16 @@ static void refresh_pipeline(DrawCache& cache, GXPrimitive prim, GXVtxFmt fmt, u
   }
   const PipelineConfig& wanted = haveProbe ? cache.probe : derived;
   cache.probeValid = false;
+  const uint32_t fast = g_fifoFast.load(std::memory_order_relaxed);
+  const bool fastCompare = (fast & AURORA_FIFO_FAST_PIPELINE_COMPARE) != 0;
 
   cache.fmt = fmt;
   cache.lineMode = lineMode;
-  if (layoutKey == cache.targetLayoutKey && std::memcmp(&wanted, &cache.config, sizeof(PipelineConfig)) == 0) {
+  // A probe from settle_pipeline_dirty was already found different from cache.config
+  // (nothing changes it in between), so PIPELINE_COMPARE does not compare it again.
+  if (layoutKey == cache.targetLayoutKey &&
+      (fastCompare ? !haveProbe && pipeline_equal_active(wanted, cache.config)
+                   : std::memcmp(&wanted, &cache.config, sizeof(PipelineConfig)) == 0)) {
     // The state was written but came out where it already was.
     state.dirty &= ~DirtyPipeline;
     return;
@@ -464,7 +526,11 @@ static void refresh_pipeline(DrawCache& cache, GXPrimitive prim, GXVtxFmt fmt, u
   memo_resolve(
       g_pipelineMemo, g_pipelineMemoEnabled.load(std::memory_order_relaxed), kMemoKindGx, layoutKey,
       gfx::pipeline_generation(), cache.config.version, cache.config,
-      [&] { return static_cast<uint64_t>(xxh3_hash(cache.config)); }, cache.pipelineRef, cache.shaderInfo,
+      [&] {
+        return (fast & AURORA_FIFO_FAST_PIPELINE_HASH) != 0 ? pipeline_hash_active(cache.config)
+                                                            : static_cast<uint64_t>(xxh3_hash(cache.config));
+      },
+      cache.pipelineRef, cache.shaderInfo,
       [&] {
         cache.shaderInfo = build_shader_info(cache.config.shaderConfig);
         cache.pipelineRef = gfx::pipeline_ref(cache.config);
@@ -475,6 +541,11 @@ static void refresh_pipeline(DrawCache& cache, GXPrimitive prim, GXVtxFmt fmt, u
   if (!hadPipeline || sampledBefore != cache.shaderInfo.sampledTextures ||
       sampledIndirectBefore != cache.shaderInfo.sampledIndTextures) {
     cache.bindGeneration = 0;
+    // aleks2 (V1, black ground): the texture bind group was built for the previous shader's slots. Without this,
+    // refresh_bind_groups' "only the generation moved" check compares the new shader's slots with themselves
+    // (already resolved by earlier draws), finds them unchanged and keeps the old group, whose extra slots hold the
+    // empty 1x1 texture: Twilight Princess' 3-texture terrain after a 2-texture draw sampled black.
+    state.dirty |= DirtyTextures;
   }
 }
 
@@ -487,6 +558,70 @@ static std::array<const void*, MaxTextures> sampled_texture_refs(const ShaderInf
     }
   }
   return refs;
+}
+
+// aleks2 (FIFO-opt, BIND_MEMO): texture bind groups of this frame by what
+// build_bind_groups reads, each sampled slot's texture view and sampler descriptor.
+// A hit returns the BindGroupRef the same descriptor produced earlier in the frame;
+// that bind group is in the cache, marked used this frame, and holds its views, so no
+// view address can be reused while the entry can match. Entries are valid for their
+// frame only (clear_draw_cache), so every texture set still goes through
+// bind_group_ref once a frame. Direct-mapped; a collision only costs a miss.
+struct BindMemoKey {
+  std::array<uintptr_t, MaxTextures> views{};
+  // addressModeU/V/W, magFilter, minFilter, mipmapFilter, lodMinClamp, lodMaxClamp
+  // (bits), compare, maxAnisotropy: get_descriptor's output, field by field.
+  std::array<std::array<uint32_t, 10>, MaxTextures> samplers{};
+};
+static_assert(std::has_unique_object_representations_v<BindMemoKey>);
+
+struct BindMemoEntry {
+  uint64_t frame = 0;
+  uint64_t hash = 0;
+  BindMemoKey key;
+  GXBindGroups groups;
+};
+constexpr size_t kBindMemoSize = 256;
+std::unique_ptr<BindMemoEntry[]> sBindMemo;
+uint64_t sBindMemoFrame = 1;
+
+static void bump_fast(std::atomic<uint64_t>& counter) noexcept {
+  counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+}
+
+static GXBindGroups memo_bind_groups(const ShaderInfo& info) noexcept {
+  if (!info.sampledTextures.any() && !info.sampledIndTextures.any()) {
+    return {}; // as build_bind_groups
+  }
+  BindMemoKey key{};
+  for (u32 i = 0; i < MaxTextures; ++i) {
+    const auto& tex = g_gxState.textures[i];
+    if (!tex || !(info.sampledTextures[i] || info.sampledIndTextures[i])) {
+      continue; // build_bind_groups binds the empty view and sampler here
+    }
+    key.views[i] = reinterpret_cast<uintptr_t>(tex.ref->sampleTextureView.Get());
+    const wgpu::SamplerDescriptor d = tex.get_descriptor();
+    key.samplers[i] = {static_cast<uint32_t>(d.addressModeU),  static_cast<uint32_t>(d.addressModeV),
+                       static_cast<uint32_t>(d.addressModeW),  static_cast<uint32_t>(d.magFilter),
+                       static_cast<uint32_t>(d.minFilter),     static_cast<uint32_t>(d.mipmapFilter),
+                       std::bit_cast<uint32_t>(d.lodMinClamp), std::bit_cast<uint32_t>(d.lodMaxClamp),
+                       static_cast<uint32_t>(d.compare),       static_cast<uint32_t>(d.maxAnisotropy)};
+  }
+  const uint64_t hash = xxh3_hash_s(&key, sizeof(key));
+  if (!sBindMemo) {
+    sBindMemo = std::make_unique<BindMemoEntry[]>(kBindMemoSize);
+  }
+  BindMemoEntry& e = sBindMemo[hash & (kBindMemoSize - 1)];
+  if (e.frame == sBindMemoFrame && e.hash == hash && std::memcmp(&e.key, &key, sizeof(key)) == 0) {
+    bump_fast(g_fifoFastStats.bindMemoHits);
+    return e.groups;
+  }
+  bump_fast(g_fifoFastStats.bindMemoMisses);
+  e.frame = sBindMemoFrame;
+  e.hash = hash;
+  e.key = key;
+  e.groups = build_bind_groups(info);
+  return e.groups;
 }
 
 // Rebuilds the texture bind groups if the bound textures may have changed. Returns
@@ -513,7 +648,9 @@ static bool refresh_bind_groups(DrawCache& cache) noexcept {
   }
 
   gfx::detail::count_draw_event(gfx::detail::DrawEvent::BindGroupRebuild);
-  cache.bindGroups = build_bind_groups(cache.shaderInfo);
+  cache.bindGroups = (g_fifoFast.load(std::memory_order_relaxed) & AURORA_FIFO_FAST_BIND_MEMO) != 0
+                         ? memo_bind_groups(cache.shaderInfo)
+                         : build_bind_groups(cache.shaderInfo);
   cache.bindGeneration = texture::current_bind_generation();
   state.dirty &= ~DirtyTextures;
   // For texture_size_bias uniform
@@ -606,7 +743,14 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
   u32 numIndices = 0;
   gfx::Range idxRange;
 
-  if (prim != GX_TRIANGLES) {
+  if (prim != GX_TRIANGLES && (g_fifoFast.load(std::memory_order_relaxed) & AURORA_FIFO_FAST_DIRECT_INDICES) != 0) {
+    // aleks2 (FIFO-opt): the same indices, written in place.
+    const u32 count = index_gen::count(prim, vtxCount);
+    if (u8* out = gfx::map_indices(count * sizeof(u16), 4, idxRange)) {
+      index_gen::write(out, prim, 0, vtxCount);
+    }
+    numIndices = static_cast<u16>(count);
+  } else if (prim != GX_TRIANGLES) {
     ZoneScopedN("build idx buffer");
     static ByteBuffer idxBuf;
     numIndices = prepare_idx_buffer(idxBuf, prim, 0, vtxCount);
@@ -630,7 +774,10 @@ static void settle_pipeline_dirty(GXPrimitive prim, GXVtxFmt fmt, bool fmtMatch)
   }
   cache.probe = PipelineConfig{};
   populate_pipeline_config(cache.probe, prim, fmt);
-  if (std::memcmp(&cache.probe, &cache.config, sizeof(PipelineConfig)) == 0) {
+  const bool same = (g_fifoFast.load(std::memory_order_relaxed) & AURORA_FIFO_FAST_PIPELINE_COMPARE) != 0
+                        ? pipeline_equal_active(cache.probe, cache.config)
+                        : std::memcmp(&cache.probe, &cache.config, sizeof(PipelineConfig)) == 0;
+  if (same) {
     g_gxState.dirty &= ~DirtyPipeline;
     return;
   }
@@ -689,11 +836,32 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
     gfx::Range idxRange;
     static ByteBuffer idxBuf;
     const bool hadIndexRange = lastDraw->idxRange.size != 0;
-    if (lastDraw->indexCount == 0 && prim != GX_TRIANGLES) {
+    const bool directIdx = (g_fifoFast.load(std::memory_order_relaxed) & AURORA_FIFO_FAST_DIRECT_INDICES) != 0;
+    if (directIdx) {
+      // aleks2 (FIFO-opt): what the path below appends to idxBuf and pushes, written in
+      // place: the previous draw's triangle list if it had none yet, then this one's.
+      u32 previousCount = 0;
+      if (lastDraw->indexCount == 0 && prim != GX_TRIANGLES) {
+        previousCount = index_gen::count(GX_TRIANGLES, lastDraw->vtxCount);
+        lastDraw->indexCount = static_cast<u16>(previousCount);
+      }
+      if (lastDraw->indexCount != 0) {
+        const u32 count = index_gen::count(prim, vtxCount);
+        if (u8* out = gfx::map_indices((previousCount + count) * sizeof(u16), hadIndexRange ? 0 : 4, idxRange)) {
+          if (previousCount != 0) {
+            index_gen::write(out, GX_TRIANGLES, 0, lastDraw->vtxCount);
+          }
+          index_gen::write(out + previousCount * sizeof(u16), prim, lastDraw->vtxCount, vtxCount);
+        }
+        numIndices += static_cast<u16>(count);
+      }
+    } else if (lastDraw->indexCount == 0 && prim != GX_TRIANGLES) {
       // Generate triangle index buffer for previous draw
       lastDraw->indexCount = prepare_idx_buffer(idxBuf, GX_TRIANGLES, 0, lastDraw->vtxCount);
     }
-    if (lastDraw->indexCount != 0) {
+    if (directIdx) {
+      // written above
+    } else if (lastDraw->indexCount != 0) {
       numIndices += prepare_idx_buffer(idxBuf, prim, lastDraw->vtxCount, vtxCount);
       idxRange = gfx::push_indices(idxBuf.data(), idxBuf.size(), hadIndexRange ? 0 : 4);
       idxBuf.clear();
@@ -892,10 +1060,23 @@ void handle_aurora(ByteReader& reader) noexcept {
       } else {
         vtxSize = calc_vtx_size(fmt);
       }
-      AURORA_ASSERT(vtxSize != 0 && byteLen % vtxSize == 0,
-                    "GX_AURORA_DRAW_SIZED: {} bytes is not a whole number of size-{} vertices", byteLen, vtxSize);
+      // aleks2 (rc19): as DRAW_INDEXED below, a malformed sized draw is dropped with the rest of its buffer.
+      if (vtxSize == 0 || byteLen % vtxSize != 0 || byteLen / vtxSize > 0xFFFF || reader.remaining() < byteLen) {
+#ifndef NDEBUG
+        FATAL("GX_AURORA_DRAW_SIZED: malformed ({} bytes, size-{} vertices, {} bytes left)", byteLen, vtxSize,
+              reader.remaining());
+#endif
+        static std::atomic<u32> s_dropped{0};
+        const u32 n = s_dropped.fetch_add(1, std::memory_order_relaxed);
+        if (n < 4 || (n & (n - 1)) == 0) {
+          Log.error("GX_AURORA_DRAW_SIZED: malformed draw dropped with the rest of its buffer ({} bytes, size-{} "
+                    "vertices, {} bytes left); {} so far",
+                    byteLen, vtxSize, reader.remaining(), n + 1);
+        }
+        reader.skip(reader.remaining());
+        return;
+      }
       u32 vtxCount = byteLen / vtxSize;
-      AURORA_ASSERT(vtxCount <= 0xFFFF, "GX_AURORA_DRAW_SIZED: too many vertices ({})", vtxCount);
       draw_prim(prim, fmt, static_cast<u16>(vtxCount), reader);
     }
   } else if (subCmd == GX_AURORA_DRAW_INDEXED) {
@@ -905,12 +1086,7 @@ void handle_aurora(ByteReader& reader) noexcept {
     const u32 indexCount = reader.read<u32>();
     const GXVtxFmt fmt = static_cast<GXVtxFmt>(cmd & CP_VAT_MASK);
     const GXPrimitive prim = static_cast<GXPrimitive>(cmd & CP_OPCODE_MASK);
-    AURORA_ASSERT(prim == GX_TRIANGLES, "GX_AURORA_DRAW_INDEXED: primitive must be GX_TRIANGLES, got {}",
-                  static_cast<u32>(prim));
     const size_t idxBytes = static_cast<size_t>(indexCount) * sizeof(u16);
-    // Index data is always host-endian; push it to the GPU buffer as-is
-    const auto indexData = reader.take(idxBytes);
-    const gfx::Range idxRange = gfx::push_indices(indexData.data(), indexData.size(), 4);
     u32 vtxSize;
     if (g_gxState.lastVtxFmt == fmt) {
       vtxSize = g_gxState.lastVtxSize;
@@ -918,6 +1094,28 @@ void handle_aurora(ByteReader& reader) noexcept {
       vtxSize = calc_vtx_size(fmt);
     }
     const u32 totalVtxBytes = vtxCount * vtxSize;
+    // aleks2 (rc19): a malformed indexed draw (not triangles, or its index or vertex data running past the commands
+    // it came in) is dropped with the rest of that buffer, whose following bytes cannot be trusted either. rc18 on
+    // the console aborted here in Reader::take, from a display list that was corrupt by the time the game drew it
+    // (a warp into a boss event, with a mod's models being created). Debug builds still stop on it.
+    if (prim != GX_TRIANGLES || reader.remaining() < idxBytes + static_cast<size_t>(totalVtxBytes)) {
+#ifndef NDEBUG
+      FATAL("GX_AURORA_DRAW_INDEXED: malformed (primitive {}, {} indices, {} vertices of {} bytes, {} bytes left)",
+            static_cast<u32>(prim), indexCount, vtxCount, vtxSize, reader.remaining());
+#endif
+      static std::atomic<u32> s_dropped{0};
+      const u32 n = s_dropped.fetch_add(1, std::memory_order_relaxed);
+      if (n < 4 || (n & (n - 1)) == 0) {  // the first few, then at powers of two
+        Log.error("GX_AURORA_DRAW_INDEXED: malformed draw dropped with the rest of its buffer (primitive {}, {} "
+                  "indices, {} vertices of {} bytes, {} bytes left); {} so far",
+                  static_cast<u32>(prim), indexCount, vtxCount, vtxSize, reader.remaining(), n + 1);
+      }
+      reader.skip(reader.remaining());
+      return;
+    }
+    // Index data is always host-endian; push it to the GPU buffer as-is
+    const auto indexData = reader.take(idxBytes);
+    const gfx::Range idxRange = gfx::push_indices(indexData.data(), indexData.size(), 4);
     const auto vertexData = reader.take(totalVtxBytes);
     const gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), 4);
     if (indexCount != 0) {
@@ -945,6 +1143,7 @@ void clear_draw_cache() noexcept {
   sDrawCache.fogRange = {};
   sDrawCache.hasFogRange = false;
   sDrawCache.probeValid = false;
+  ++sBindMemoFrame; // aleks2 (FIFO-opt): this frame's bind groups no longer match
 }
 
 } // namespace aurora::gx::fifo

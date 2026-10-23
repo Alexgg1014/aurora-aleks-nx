@@ -32,6 +32,10 @@
 #include <absl/container/flat_hash_map.h>
 #include <magic_enum.hpp>
 #include <tracy/Tracy.hpp>
+#if defined(AURORA_GFX_DEKO3D)
+#include "dk_gfx.hpp"
+#include "dk_runtime.hpp"
+#endif
 
 namespace aurora::gfx {
 using namespace detail;
@@ -698,6 +702,23 @@ void queue_texture_upload_data(const uint8_t* data, uint32_t bytesPerRow, uint32
     return;
   }
 
+#if defined(AURORA_GFX_DEKO3D)
+  if (dk::active()) {
+    // aleks2 (deko3d P1, after SwitchWaker patch 0014): deko3d memory of its own (256-byte rows, as the
+    // staging's), freed once the GPU has copied it
+    const auto overflow = dk::overflow_upload(data, bytesPerRow, rowsPerImage);
+    const wgpu::TexelCopyBufferLayout layout{
+        .offset = 0,
+        .bytesPerRow = bytesPerRow,
+        .rowsPerImage = rowsPerImage,
+    };
+    TextureUpload upload{layout, std::move(tex), size};
+    upload.dkBlock = overflow.block;
+    upload.dkGpu = overflow.gpu;
+    queue_texture_upload(std::move(upload));
+    return;
+  }
+#endif
   const uint64_t uploadSize = copyBytesPerRow * rowsPerImage;
   const wgpu::BufferDescriptor descriptor{
       .label = "Overflow Texture Upload Buffer",
@@ -1215,6 +1236,26 @@ Range push_uniform(const uint8_t* data, size_t length) {
   return push(current_frame_packet().uniforms, data, length, resources().limits.minUniformBufferOffsetAlignment);
 }
 
+uint8_t* map_indices(size_t length, size_t alignment, Range& range) {
+  if (!check_recording("map_indices")) {
+    range = {};
+    return nullptr;
+  }
+  auto& indices = current_frame_packet().indices;
+  range = map(indices, length, alignment);
+  return indices.data() + range.offset;
+}
+
+ByteBuffer* begin_uniform_block(size_t& unpadded) {
+  if (!check_recording("begin_uniform_block")) {
+    return nullptr;
+  }
+  auto& uniforms = current_frame_packet().uniforms;
+  unpadded = uniforms.size();
+  map(uniforms, 0, resources().limits.minUniformBufferOffsetAlignment);
+  return &uniforms;
+}
+
 Range push_storage(const uint8_t* data, size_t length) {
   ZoneScoped;
   if (!check_recording("push_storage")) {
@@ -1271,3 +1312,21 @@ void pop_debug_group() {
   aurora::gfx::g_recorder.debugGroupStack.pop_back();
 #endif
 }
+
+#if defined(AURORA_GFX_DEKO3D)
+// aleks2 (deko3d P1): the deko3d encoder (lib/deko) replays draw commands by kind.
+aurora::gfx::detail::DrawKind aurora::gfx::detail::draw_kind(DrawEncoder encoder) noexcept {
+  if (encoder == encode_draw<gx::render, gx::DrawData>) {
+    return DrawKind::Gx;
+  }
+  if (encoder == encode_draw<clear::render, clear::DrawData>) {
+    return DrawKind::Clear;
+  }
+#ifdef AURORA_ENABLE_RMLUI
+  if (encoder == encode_draw<rmlui::render, rmlui::DrawData>) {
+    return DrawKind::Rml;
+  }
+#endif
+  return DrawKind::Other;
+}
+#endif

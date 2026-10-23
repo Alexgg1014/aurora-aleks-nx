@@ -1,3 +1,4 @@
+#include <aurora/hd_rumble.h>
 #include "device.hpp"
 
 #include <algorithm>
@@ -214,6 +215,13 @@ void rumble(const uint16_t lowFreq, const uint16_t highFreq, const uint16_t dura
 namespace detail {
 void shutdown_rumble() noexcept {}
 } // namespace detail
+#endif
+
+#if !defined(__SWITCH__)
+// aleks2 (V1-rc16): aurora/hd_rumble.h is the Switch's (device_switch.cpp); elsewhere it does nothing.
+extern "C" void aurora_hd_rumble_play(int, const AuroraHdKey*, int, bool) {}
+extern "C" void aurora_hd_rumble_stop(void) {}
+extern "C" void aurora_rumble_set_gain(float) {}
 #endif
 
 #if !defined(__SWITCH__)

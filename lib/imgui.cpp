@@ -22,6 +22,10 @@
 #include "backends/imgui_impl_sdlrenderer3.h"
 #include "backends/imgui_impl_wgpu.h"
 #include "tracy/Tracy.hpp"
+#if defined(AURORA_GFX_DEKO3D)
+#include "dk_aurora.h"
+#include "dk_runtime.hpp"
+#endif
 
 namespace aurora::imgui {
 namespace {
@@ -75,6 +79,15 @@ void enqueue_texture_upload(wgpu::Buffer buffer, wgpu::TexelCopyTextureInfo dst,
 }
 } // namespace
 
+#if defined(AURORA_GFX_DEKO3D)
+// aleks2 (deko3d P1, after SwitchWaker patch 0013): with the deko3d renderer ImGui is drawn by
+// lib/deko (mpl/overlay.cpp): textures through aurora_switch_dk_imgui_texture, the frozen draw data at
+// the present; imgui_impl_wgpu is not used.
+bool deko3d() noexcept { return gfx::dk::active(); }
+#else
+constexpr bool deko3d() noexcept { return false; }
+#endif
+
 struct DrawData::Impl {
   ImDrawData drawData;
   std::vector<std::unique_ptr<ImDrawList>> drawLists;
@@ -97,6 +110,10 @@ void initialize() noexcept {
   g_useSdlRenderer = renderer != nullptr;
   if (g_useSdlRenderer) {
     ImGui_ImplSDLRenderer3_Init(renderer);
+  } else if (deko3d()) {
+    ImGuiIO& io = ImGui::GetIO();
+    io.BackendRendererName = "dusklight_deko3d";
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;
   } else {
     ImGui_ImplWGPU_InitInfo info;
     info.Device = webgpu::g_device.Get();
@@ -109,7 +126,7 @@ void shutdown() noexcept {
   ZoneScoped;
   if (g_useSdlRenderer) {
     ImGui_ImplSDLRenderer3_Shutdown();
-  } else {
+  } else if (!deko3d()) {
     ImGui_ImplWGPU_Shutdown();
   }
   ImGui_ImplSDL3_Shutdown();
@@ -183,6 +200,20 @@ void new_frame(const AuroraWindowSize& size) noexcept {
     }
     ImGui_ImplSDLRenderer3_NewFrame();
     g_scale = size.scale;
+  } else if (deko3d()) {
+#if defined(AURORA_GFX_DEKO3D)
+    // the font atlas (again after a scale change) as one RGBA8 texture for lib/deko
+    ImFontAtlas* fonts = ImGui::GetIO().Fonts;
+    if (g_scale != size.scale || !fonts->IsBuilt() || fonts->TexID == ImTextureID{}) {
+      g_scale = size.scale;
+      unsigned char* pixels = nullptr;
+      int width = 0;
+      int height = 0;
+      fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+      fonts->SetTexID(static_cast<ImTextureID>(
+          aurora_switch_dk_imgui_texture(static_cast<uint32_t>(width), static_cast<uint32_t>(height), pixels)));
+    }
+#endif
   } else {
     if (g_scale != size.scale) {
       if (g_scale > 0.f) {
@@ -235,6 +266,8 @@ void render(const wgpu::RenderPassEncoder& pass, const DrawData& drawData) noexc
     SDL_RenderClear(renderer);
     ImGui_ImplSDLRenderer3_RenderDrawData(data, renderer);
     SDL_RenderPresent(renderer);
+  } else if (deko3d()) {
+    // (lib/deko draws it at the present: present_deko3d)
   } else {
     pass.PushDebugGroup("Aurora: Dear Imgui");
     ImGui_ImplWGPU_RenderDrawData(data, pass.Get());
@@ -242,7 +275,20 @@ void render(const wgpu::RenderPassEncoder& pass, const DrawData& drawData) noexc
   }
 }
 
+#if defined(AURORA_GFX_DEKO3D)
+void present_deko3d(const DrawData& drawData) noexcept {
+  ZoneScoped;
+  const ImDrawData* data = drawData.m_impl ? &drawData.m_impl->drawData : nullptr;
+  aurora_switch_dk_present(data != nullptr && data->CmdListsCount > 0 ? data : nullptr);
+}
+#endif
+
 ImTextureID add_texture(uint32_t width, uint32_t height, const uint8_t* data) noexcept {
+#if defined(AURORA_GFX_DEKO3D)
+  if (deko3d()) {
+    return static_cast<ImTextureID>(aurora_switch_dk_imgui_texture(width, height, data));
+  }
+#endif
   if (SDL_Renderer* renderer = window::get_sdl_renderer()) {
     SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, width, height);
     SDL_UpdateTexture(texture, nullptr, data, width * 4);

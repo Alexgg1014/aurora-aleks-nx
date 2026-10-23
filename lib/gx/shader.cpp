@@ -9,7 +9,10 @@
 
 #include <dolphin/gx/GXEnum.h>
 
+#include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
+#include <atomic>
+#include <chrono>
 #include <mutex>
 #include <string_view>
 #include <utility>
@@ -2054,6 +2057,34 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
   return shaderSource;
 }
 
+} // namespace aurora::gx
+
+namespace aurora::gfx {
+extern std::atomic<uint64_t> g_gxSourceNs;  // gfx/pipeline_cache.cpp (V1-rc1)
+extern std::atomic<uint64_t> g_gxModuleNs;
+extern std::atomic<uint32_t> g_gxModulesReused;
+} // namespace aurora::gfx
+
+namespace aurora::gx {
+// aleks2 (V1-rc1): pipelines that differ only in blend/depth state share their shader. The module is
+// kept (the pipelines hold it alive anyway), so the WGSL text is neither built nor parsed again.
+static std::mutex g_moduleMutex;
+static absl::flat_hash_map<HashType, wgpu::ShaderModule> g_modules;
+#ifdef __SWITCH__
+// aleks2 (V1-rc5): a kept module keeps Dawn's parsed program (Tint) and its WGSL alive -- Dawn frees them when
+// the last application reference goes. 8192 kept them all, for the whole session: a tester's rc4 compiling from
+// scratch for 25 minutes died of bad_alloc. The reuse that matters is back to back (the same shader for the
+// scene and the offscreen layout), which a small set still catches.
+constexpr size_t MaxKeptModules = 256;
+#else
+constexpr size_t MaxKeptModules = 8192;
+#endif
+
+static uint64_t ns_since(std::chrono::steady_clock::time_point start) {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
 wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout,
                                 DstAlphaMode dstAlphaMode) noexcept {
   ZoneScoped;
@@ -2063,8 +2094,17 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTar
       normalAttachment = i;
     }
   }
-  const auto shaderSource = build_shader_source(config, dstAlphaMode, normalAttachment);
   const auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(normalAttachment, xxh3_hash(config)));
+  {
+    std::lock_guard lock{g_moduleMutex};
+    if (const auto it = g_modules.find(hash); it != g_modules.end()) {
+      gfx::g_gxModulesReused.fetch_add(1, std::memory_order_relaxed);
+      return it->second;
+    }
+  }
+  const auto sourceStart = std::chrono::steady_clock::now();
+  const auto shaderSource = build_shader_source(config, dstAlphaMode, normalAttachment);
+  gfx::g_gxSourceNs.fetch_add(ns_since(sourceStart), std::memory_order_relaxed);
   wgpu::ShaderSourceWGSL wgslDescriptor{};
   wgslDescriptor.code = shaderSource.c_str();
   const auto label = fmt::format("GX Shader {:x}", hash);
@@ -2072,6 +2112,16 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTar
       .nextInChain = &wgslDescriptor,
       .label = label.c_str(),
   };
-  return webgpu::g_device.CreateShaderModule(&shaderDescriptor);
+  const auto moduleStart = std::chrono::steady_clock::now();
+  auto module = webgpu::g_device.CreateShaderModule(&shaderDescriptor);
+  gfx::g_gxModuleNs.fetch_add(ns_since(moduleStart), std::memory_order_relaxed);
+  if (module) {
+    std::lock_guard lock{g_moduleMutex};
+    if (g_modules.size() >= MaxKeptModules) {
+      g_modules.clear();
+    }
+    g_modules.emplace(hash, module);
+  }
+  return module;
 }
 } // namespace aurora::gx

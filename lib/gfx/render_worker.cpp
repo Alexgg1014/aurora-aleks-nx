@@ -7,6 +7,9 @@
 #include <chrono>
 
 #include <tracy/Tracy.hpp>
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
 
 namespace aurora::gfx::render_worker {
 namespace {
@@ -21,6 +24,17 @@ std::thread::id g_workerThreadId;
 // aleks2 (H35): written by the worker only, read by anyone.
 std::atomic<uint64_t> g_itemsRun{0};
 std::atomic<uint64_t> g_workNs{0};
+// aleks2 (deko3d P1): the worker thread's own CPU time (kernel tick count), sampled after each end of frame
+std::atomic<uint64_t> g_threadCpuNs{0};
+
+void sample_thread_cpu() noexcept {
+#ifdef __SWITCH__
+  u64 ticks = 0;
+  if (R_SUCCEEDED(svcGetInfo(&ticks, InfoType_ThreadTickCount, CUR_THREAD_HANDLE, UINT64_MAX))) {
+    g_threadCpuNs.store(armTicksToNs(ticks), std::memory_order_relaxed);
+  }
+#endif
+}
 
 uint64_t steady_ns() noexcept {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -60,6 +74,9 @@ void worker_main(std::stop_token token) {
       g_workNs.store(g_workNs.load(std::memory_order_relaxed) + (steady_ns() - start), std::memory_order_relaxed);
     }
     g_itemsRun.store(g_itemsRun.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    if (item->type == ItemType::EndFrame) {
+      sample_thread_cpu();
+    }
     complete_sync(item->sync);
     g_pendingItems.fetch_sub(1, std::memory_order_acq_rel);
     if (item->type == ItemType::Shutdown) {
@@ -100,6 +117,7 @@ void enqueue(QueueItem item) {
 // to these. The counters they read stay private above.
 uint64_t items_run() noexcept { return g_itemsRun.load(std::memory_order_relaxed); }
 uint64_t work_ns() noexcept { return g_workNs.load(std::memory_order_relaxed); }
+uint64_t thread_cpu_ns() noexcept { return g_threadCpuNs.load(std::memory_order_relaxed); }
 
 BoundedQueue::BoundedQueue(size_t capacity) : m_capacity(capacity) {}
 

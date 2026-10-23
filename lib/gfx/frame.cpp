@@ -15,11 +15,13 @@
 #endif
 #include "../webgpu/gpu.hpp"
 #include "../webgpu/gpu_prof.hpp"
+#include "../webgpu/gpu_timing.hpp"
 
 #include <aurora/tuning.h>
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -33,7 +35,20 @@
 #include <tracy/Tracy.hpp>
 #include <magic_enum.hpp>
 
+#if defined(AURORA_GFX_DEKO3D)
+// aleks2 (deko3d P1, after SwitchWaker patch 0014): with the deko3d renderer the staging slots are deko3d
+// memory the FIFO thread writes and the GPU reads in place (lib/deko/dk_encode.cpp), always "mapped"
+// and ready once the GPU has finished their frame; three of them (one more than the frame slots), not
+// five; the shared WebGPU buffers shrink to 64 KiB (only the Null device's bind groups use them).
+#include "dk_encode.hpp"
+#include "dk_gfx.hpp"
+#include "dk_runtime.hpp"
+#endif
+
 namespace aurora::gfx {
+// aleks2 (deko3d P1): frames and draw commands encoded, for the render worker's CPU per draw
+std::atomic<uint64_t> g_encodedFrames{0};
+std::atomic<uint64_t> g_encodedDraws{0};
 using namespace detail;
 using webgpu::g_device;
 using webgpu::g_instance;
@@ -52,6 +67,10 @@ enum class BufferMapState {
 
 std::array<wgpu::Buffer, StagingBufferCount> g_stagingBuffers;
 std::array<std::atomic<BufferMapState>, StagingBufferCount> g_mappingStates;
+#if defined(AURORA_GFX_DEKO3D)
+constexpr size_t DekoStagingCount = FrameSlotCount + 1;
+std::array<dk::StagingMemory, StagingBufferCount> g_dkStaging;
+#endif
 uint32_t g_frameIndex = UINT32_MAX;
 
 std::array<FramePacket, FrameSlotCount> g_framePackets;
@@ -217,6 +236,16 @@ void pace_frame_start() {
 }
 
 void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false) {
+#if defined(AURORA_GFX_DEKO3D)
+  if (dk::active()) {
+    // deko3d memory is always mapped; wait_for_staging_buffer waits for the GPU instead
+    g_mappingStates[slot].store(BufferMapState::Mapped, std::memory_order_release);
+    if (releaseSlotOnCompletion) {
+      g_stagingSlots.release(slot);
+    }
+    return;
+  }
+#endif
   auto expected = BufferMapState::Unmapped;
   if (!g_mappingStates[slot].compare_exchange_strong(expected, BufferMapState::Mapping, std::memory_order_acq_rel,
                                                      std::memory_order_acquire)) {
@@ -420,19 +449,47 @@ void initialize() {
     };
     out = g_device.CreateBuffer(&descriptor);
   };
-  createBuffer(g_resources.uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, UniformBufferSize,
-               "Shared Uniform Buffer");
-  createBuffer(g_resources.vertexBuffer,
-               wgpu::BufferUsage::Storage | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst, VertexBufferSize,
-               "Shared Vertex Buffer");
-  createBuffer(g_resources.indexBuffer, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst, IndexBufferSize,
-               "Shared Index Buffer");
-  createBuffer(g_resources.storageBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, StorageBufferSize,
-               "Shared Storage Buffer");
-  for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
-    const auto label = fmt::format("Staging Buffer {}", i);
-    createBuffer(g_stagingBuffers[i], wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc, StagingBufferSize,
-                 label.c_str());
+  bool dekoStaging = false;
+#if defined(AURORA_GFX_DEKO3D)
+  if (dk::active()) {
+    dekoStaging = true;
+    constexpr uint64_t NullBufferSize = 64 * 1024;
+    createBuffer(g_resources.uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, NullBufferSize,
+                 "Shared Uniform Buffer");
+    createBuffer(g_resources.vertexBuffer,
+                 wgpu::BufferUsage::Storage | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst, NullBufferSize,
+                 "Shared Vertex Buffer");
+    createBuffer(g_resources.indexBuffer, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst, NullBufferSize,
+                 "Shared Index Buffer");
+    createBuffer(g_resources.storageBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, NullBufferSize,
+                 "Shared Storage Buffer");
+    // slots DekoStagingCount.. stay taken for the whole run: the FIFO thread records one frame while
+    // the GPU reads the two before it
+    for (size_t i = 0; i < StagingBufferCount; ++i) {
+      (void)g_stagingSlots.acquire();
+    }
+    for (size_t i = 0; i < DekoStagingCount; ++i) {
+      g_dkStaging[i] = dk::staging_create(i, StagingBufferSize);
+      g_stagingSlots.release(i);
+    }
+    dk::present_init();
+  }
+#endif
+  if (!dekoStaging) {
+    createBuffer(g_resources.uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
+                 UniformBufferSize, "Shared Uniform Buffer");
+    createBuffer(g_resources.vertexBuffer,
+                 wgpu::BufferUsage::Storage | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst,
+                 VertexBufferSize, "Shared Vertex Buffer");
+    createBuffer(g_resources.indexBuffer, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst, IndexBufferSize,
+                 "Shared Index Buffer");
+    createBuffer(g_resources.storageBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                 StorageBufferSize, "Shared Storage Buffer");
+    for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
+      const auto label = fmt::format("Staging Buffer {}", i);
+      createBuffer(g_stagingBuffers[i], wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc, StagingBufferSize,
+                   label.c_str());
+    }
   }
   for (auto& state : g_mappingStates) {
     state.store(BufferMapState::Unmapped, std::memory_order_release);
@@ -582,6 +639,15 @@ void shutdown() {
 
 bool wait_for_staging_buffer(size_t slot) {
   ZoneScopedN("Wait for buffer map");
+#if defined(AURORA_GFX_DEKO3D)
+  if (dk::active()) {
+    // the GPU finished the last frame that read the slot (deko3d's "map")
+    while (!dk::staging_ready(slot)) {
+      wait_for_gpu_progress(std::chrono::microseconds{200});
+    }
+    return true;
+  }
+#endif
   map_staging_buffer(slot);
   while (true) {
     const auto mappingState = g_mappingStates[slot].load(std::memory_order_acquire);
@@ -672,11 +738,20 @@ bool begin_frame() {
   frame.stagingBuffer = *stagingSlot;
   size_t bufferOffset = 0;
   const auto& stagingBuf = g_stagingBuffers[*stagingSlot];
+#if defined(AURORA_GFX_DEKO3D)
+  u8* const dekoCpu = dk::active() ? g_dkStaging[*stagingSlot].cpu : nullptr;
+#else
+  u8* const dekoCpu = nullptr;
+#endif
   const auto mapBuffer = [&](ByteBuffer& buf, uint64_t size) {
     if (size <= 0) {
       return;
     }
-    buf = ByteBuffer{static_cast<u8*>(stagingBuf.GetMappedRange(bufferOffset, size)), static_cast<size_t>(size)};
+    if (dekoCpu != nullptr) {
+      buf = ByteBuffer{dekoCpu + bufferOffset, static_cast<size_t>(size)};
+    } else {
+      buf = ByteBuffer{static_cast<u8*>(stagingBuf.GetMappedRange(bufferOffset, size)), static_cast<size_t>(size)};
+    }
     bufferOffset += size;
   };
   mapBuffer(frame.verts, VertexBufferSize);
@@ -690,9 +765,17 @@ bool begin_frame() {
   begin_recording(frame, frameSlot);
   begin_pipeline_frame();
   render_worker::enqueue_begin_frame(frame.frameId, [frameSlot] {
+#if defined(AURORA_GFX_DEKO3D)
+    if (dk::active()) {
+      // the frame is recorded into deko3d's command buffer (lib/deko)
+      dk::frame_begin(g_framePackets[frameSlot]);
+      return;
+    }
+#endif
     constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "Redraw encoder"};
     g_framePackets[frameSlot].encoder = g_device.CreateCommandEncoder(&EncoderDescriptor);
     webgpu::gpu_prof::frame_begin(g_framePackets[frameSlot].encoder);
+    webgpu::gpu_timing::frame_begin(g_framePackets[frameSlot].encoder);
   });
   g_cpuFrameStart = PresentClock::now();
   return true;
@@ -716,13 +799,22 @@ void end_frame(EndFrameCallback callback) {
   const size_t stagingSlot = frame.stagingBuffer;
   render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {
     auto& packet = g_framePackets[frameSlot];
-    g_stagingBuffers[stagingSlot].Unmap();
-    g_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
+#if defined(AURORA_GFX_DEKO3D)
+    const bool deko3d = dk::active();
+#else
+    constexpr bool deko3d = false;
+#endif
+    if (!deko3d) {
+      g_stagingBuffers[stagingSlot].Unmap();
+      g_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
+    }
     auto encoder = std::move(packet.encoder);
     const auto stats = packet.stats;
     auto afterSubmitCallbacks = std::move(packet.afterSubmitCallbacks);
     packet = {};
     g_resources.stats.drawCallCount = stats.drawCallCount;
+    g_encodedFrames.fetch_add(1, std::memory_order_relaxed);
+    g_encodedDraws.fetch_add(stats.drawCallCount, std::memory_order_relaxed);
     g_resources.stats.mergedDrawCallCount = stats.mergedDrawCallCount;
     g_resources.stats.bindGroupRebuilds = stats.bindGroupRebuilds;
     g_resources.stats.pipelineRebuilds = stats.pipelineRebuilds;
@@ -741,6 +833,11 @@ void end_frame(EndFrameCallback callback) {
     }
     g_frameSlots.release(frameSlot);
     expire_cached_bind_groups();
+#if defined(AURORA_GFX_DEKO3D)
+    if (deko3d) {
+      dk::frame_presented(stagingSlot);  // (the present ran in the callback: the slot's frame)
+    }
+#endif
     map_staging_buffer(stagingSlot, true);
     process_events();
   });
@@ -753,6 +850,75 @@ void after_submit() noexcept { depth_peek::after_submit(); }
 void gpu_synchronize() { render_worker::synchronize(); }
 
 void synchronize() { render_worker::synchronize(); }
+
+// aleks2 (V1): input -> present probe, observability only (it changes nothing the game or the renderer does). The
+// first PADRead of a frame (pad.cpp) to that frame's present, as a 30 s summary line in the log; so late input and
+// a display-locked limiter (V1.1, after ChanseyIsTheBest/renut_nx c319b29, used with his permission) can be decided
+// with data. AURORA_LATENCY_PROBE=0 (perf-lab latency_probe=0) turns the line off.
+namespace {
+std::atomic<int64_t> g_latencyFirstInputNs{0};
+std::mutex g_latencyMutex;
+struct LatencyWindow {
+  int64_t startNs = 0;
+  uint64_t frames = 0;
+  int64_t sumNs = 0;
+  int64_t maxNs = 0;
+  std::array<uint32_t, 201> histogramMs{};  // 0..199 ms, 200 = more
+} g_latency;
+
+bool latency_probe_on() noexcept {
+  static const bool on = [] {
+    const char* e = std::getenv("AURORA_LATENCY_PROBE");
+    return e == nullptr || *e == '\0' || *e != '0';
+  }();
+  return on;
+}
+} // namespace
+
+// pad.cpp's PADRead: the first read since the last end_frame keeps its time
+extern "C" void aurora_latency_note_input(void) noexcept {
+  int64_t expected = 0;
+  g_latencyFirstInputNs.compare_exchange_strong(expected, timestamp_ns(PresentClock::now()), std::memory_order_acq_rel);
+}
+
+int64_t latency_take_input() noexcept { return g_latencyFirstInputNs.exchange(0, std::memory_order_acq_rel); }
+
+void latency_note_presented(int64_t inputNs) noexcept {
+  if (inputNs == 0 || !latency_probe_on()) {
+    return;
+  }
+  const int64_t nowNs = timestamp_ns(PresentClock::now());
+  const int64_t d = nowNs - inputNs;
+  if (d < 0) {
+    return;
+  }
+  std::lock_guard lock{g_latencyMutex};
+  auto& w = g_latency;
+  if (w.startNs == 0) {
+    w.startNs = nowNs;
+  }
+  w.frames++;
+  w.sumNs += d;
+  w.maxNs = std::max(w.maxNs, d);
+  w.histogramMs[std::min<int64_t>(d / 1'000'000, 200)]++;
+  if (nowNs - w.startNs >= 30'000'000'000LL) {
+    const uint64_t p95Rank = (w.frames * 95 + 99) / 100;
+    uint64_t seen = 0;
+    int p95 = 200;
+    for (int i = 0; i <= 200; ++i) {
+      seen += w.histogramMs[i];
+      if (seen >= p95Rank) {
+        p95 = i;
+        break;
+      }
+    }
+    Log.info("latency: first controller read of a frame -> its present: mean {:.1f} ms, p95 {}{} ms, max {:.1f} ms "
+             "({} frames, {:.0f} s)",
+             static_cast<double>(w.sumNs) / static_cast<double>(w.frames) / 1e6, p95 >= 200 ? ">=" : "", p95,
+             static_cast<double>(w.maxNs) / 1e6, w.frames, static_cast<double>(nowNs - w.startNs) / 1e9);
+    w = LatencyWindow{};
+  }
+}
 
 void after_present() noexcept {
   const auto now = PresentClock::now();
@@ -804,3 +970,26 @@ void aurora_gfx_frame_wait_stats(AuroraFrameWaitStats* out) {
   };
 }
 float aurora_get_fps() { return aurora::gfx::calculate_fps(); }
+
+void aurora_gfx_render_cpu_stats(AuroraRenderCpuStats* out) {
+  if (out == nullptr) {
+    return;
+  }
+  using namespace aurora::gfx;
+  *out = {
+      .thread_cpu_ns = render_worker::thread_cpu_ns(),
+      .frames = g_encodedFrames.load(std::memory_order_relaxed),
+      .draws = g_encodedDraws.load(std::memory_order_relaxed),
+      .gpu_ns = 0,
+      .gpu_frames = 0,
+      .deko3d = false,
+  };
+#if defined(AURORA_GFX_DEKO3D)
+  if (aurora::gfx::dk::active()) {
+    const auto& s = aurora::gfx::dk::encode_stats();
+    out->gpu_ns = s.gpuTotalNs;
+    out->gpu_frames = s.gpuFrames;
+    out->deko3d = true;
+  }
+#endif
+}

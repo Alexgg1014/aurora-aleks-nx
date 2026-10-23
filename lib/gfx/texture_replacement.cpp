@@ -11,6 +11,7 @@
 #include "texture_convert.hpp"
 
 #include <aurora/texture.hpp>
+#include <aurora/tuning.h>
 #include <fmt/format.h>
 #include <tracy/Tracy.hpp>
 
@@ -27,6 +28,7 @@
 #include <deque>
 #include <filesystem>
 #include <list>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -42,7 +44,14 @@ namespace aurora::texture {
 namespace {
 constexpr Module Log{"aurora::texture"};
 
+#if defined(__SWITCH__)
+// aleks2 (V1-rc8): the whole process has about 3 GB on Switch; at 4 GB a large pack (Dusklight HD: 2.8 GB of DDS)
+// would never be evicted before memory ran out. perf-lab.ini texrep_budget_mb overrides it.
+constexpr uint64_t kReplacementCacheBudgetBytes = 640ull << 20;
+#else
 constexpr uint64_t kReplacementCacheBudgetBytes = 4294967296; // 4GB
+#endif
+std::atomic<uint64_t> s_cacheBudgetBytes{kReplacementCacheBudgetBytes};
 constexpr uint64_t kReplacementWildcardTextureHash = kWildcardTextureHash;
 constexpr uint64_t kReplacementWildcardTlutHash = kWildcardTlutHash;
 
@@ -141,6 +150,24 @@ uint64_t s_replacementCacheBytes = 0;
 uint64_t s_nextRegistrationId = 1;
 uint64_t s_nextSequence = 1;
 uint32_t s_sourceEntryCount = 0;
+
+// aleks2 (V1-rc12): texture-replacement usage window (dusk's texrep-<stage>.txt). Off until a reporter turns it on;
+// under s_registryMutex. What was made resident since the last take, the resident peak and the evictions.
+struct UsageRow {
+  std::string name;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t mips = 0;
+  const char* format = "";
+  uint64_t bytes = 0;
+  bool full = false;
+  uint32_t loads = 0;
+};
+std::atomic<bool> s_usageOn{false};
+absl::flat_hash_map<uint64_t, UsageRow> s_usageRows;  // by registration id
+uint64_t s_usagePeakBytes = 0;
+uint64_t s_usageEvictions = 0;
+uint64_t s_totalEvictions = 0;
 
 std::mutex s_jobMutex;
 std::condition_variable s_jobCv;
@@ -1016,6 +1043,56 @@ gfx::TextureHandle create_raw_texture_handle(const ReplacementEntry& entry) noex
   return handle;
 }
 
+const ReplacementEntry* find_selected_entry_locked(const ReplacementKey& key) noexcept;
+
+const char* usage_format_name(wgpu::TextureFormat format) noexcept {
+  switch (format) {
+  case wgpu::TextureFormat::BC1RGBAUnorm:
+    return "BC1/DXT1";
+  case wgpu::TextureFormat::BC2RGBAUnorm:
+    return "BC2/DXT3";
+  case wgpu::TextureFormat::BC3RGBAUnorm:
+    return "BC3/DXT5";
+  case wgpu::TextureFormat::BC4RUnorm:
+    return "BC4";
+  case wgpu::TextureFormat::BC5RGUnorm:
+    return "BC5";
+  case wgpu::TextureFormat::BC7RGBAUnorm:
+    return "BC7";
+  case wgpu::TextureFormat::RGBA8Unorm:
+    return "RGBA8";
+  case wgpu::TextureFormat::R8Unorm:
+    return "R8";
+  case wgpu::TextureFormat::RG8Unorm:
+    return "RG8";
+  default:
+    return "other";
+  }
+}
+
+void note_usage_locked(const ReplacementKey& key, uint64_t id, const gfx::TextureRef& texture, uint64_t bytes,
+                       Tier tier) noexcept {
+  auto& row = s_usageRows[id];
+  if (row.name.empty()) {
+    if (const auto* entry = find_selected_entry_locked(key); entry != nullptr) {
+      row.name = entry->kind == EntryKind::Raw ? entry->label : entry_path_for_log(*entry);
+      if (row.name.empty()) {
+        row.name = entry->label;
+      }
+    }
+    if (row.name.empty()) {
+      row.name = fmt::format("registration {}", id);
+    }
+  }
+  row.width = texture.size.width;
+  row.height = texture.size.height;
+  row.mips = texture.mipCount;
+  row.format = usage_format_name(texture.format);
+  row.bytes = bytes;
+  row.full = tier == Tier::Full;
+  ++row.loads;
+}
+
 void erase_cache_locked(const ReplacementKey& key) noexcept {
   const auto it = s_cacheByKey.find(key);
   if (it == s_cacheByKey.end()) {
@@ -1034,11 +1111,14 @@ void touch_cached_replacement(decltype(s_cacheByKey)::iterator it) noexcept {
 }
 
 void evict_replacement_cache_if_needed() noexcept {
-  while (s_replacementCacheBytes > kReplacementCacheBudgetBytes && !s_replacementLru.empty()) {
+  while (s_replacementCacheBytes > s_cacheBudgetBytes.load(std::memory_order_relaxed) &&
+         !s_replacementLru.empty()) {
     const auto key = s_replacementLru.back();
     const auto cache = s_cacheByKey.find(key);
     const uint64_t id = cache == s_cacheByKey.end() ? 0 : cache->second.id;
     erase_cache_locked(key);
+    ++s_totalEvictions;  // aleks2 (V1-rc12)
+    ++s_usageEvictions;
     if (id != 0) {
       gx::texture::invalidate_replacement(id);
       gx::texture::invalidate_bindings();
@@ -1053,6 +1133,9 @@ void cache_replacement_locked(const ReplacementKey& key, uint64_t id, gfx::Textu
   }
   const uint64_t replacementBytes =
       gfx::calc_texture_size(handle->format, handle->size.width, handle->size.height, handle->mipCount);
+  if (s_usageOn.load(std::memory_order_relaxed)) {
+    note_usage_locked(key, id, *handle, replacementBytes, tier);  // aleks2 (V1-rc12)
+  }
   s_replacementLru.push_front(key);
   s_cacheByKey.emplace(key, SelectedCache{
                                 .handle = std::move(handle),
@@ -1063,6 +1146,7 @@ void cache_replacement_locked(const ReplacementKey& key, uint64_t id, gfx::Textu
                             });
   s_replacementCacheBytes += replacementBytes;
   evict_replacement_cache_if_needed();
+  s_usagePeakBytes = std::max(s_usagePeakBytes, s_replacementCacheBytes);  // aleks2 (V1-rc12): after eviction
 }
 
 const ReplacementEntry* select_entry(const std::vector<ReplacementEntry>& entries) noexcept {
@@ -1677,8 +1761,8 @@ ReplacementGroup load_replacement_directory(const std::filesystem::path& root, R
     group.registrations.push_back(register_file_replacement(*parsed, candidate.path, options));
   }
 
-  Log.info("Loaded {} texture replacement registrations from {}", group.registrations.size(),
-           io::fs_path_to_string(root));
+  Log.info("Loaded {} texture replacement registrations from {} (cache budget {} MB)", group.registrations.size(),
+           io::fs_path_to_string(root), s_cacheBudgetBytes.load(std::memory_order_relaxed) >> 20);
   return group;
 }
 
@@ -1923,3 +2007,67 @@ bool wait_for_completions(uint64_t id, uint32_t count, uint32_t timeoutMs) noexc
 }
 } // namespace testing
 } // namespace aurora::gfx::texture_replacement
+
+// aleks2 (V1-rc8): the replacement cache's budget, in MB (0 keeps the platform default). Evicts at the next insert.
+extern "C" void aurora_gx_set_texrep_budget_mb(uint32_t mb) {
+  if (mb != 0) {
+    aurora::texture::s_cacheBudgetBytes.store(static_cast<uint64_t>(mb) << 20, std::memory_order_relaxed);
+  }
+}
+extern "C" uint32_t aurora_gx_get_texrep_budget_mb(void) {
+  return static_cast<uint32_t>(aurora::texture::s_cacheBudgetBytes.load(std::memory_order_relaxed) >> 20);
+}
+
+// aleks2 (V1-rc12): texture-replacement usage report (see tuning.h).
+extern "C" void aurora_gx_texrep_usage_enable(uint32_t on) {
+  using namespace aurora::texture;
+  std::lock_guard lk(s_registryMutex);
+  s_usageOn.store(on != 0, std::memory_order_relaxed);
+  s_usageRows.clear();
+  s_usagePeakBytes = s_replacementCacheBytes;
+  s_usageEvictions = 0;
+}
+
+extern "C" uint64_t aurora_gx_texrep_registered_keys(void) {
+  using namespace aurora::texture;
+  std::lock_guard lk(s_registryMutex);
+  return s_entriesByKey.size();
+}
+
+extern "C" void aurora_gx_texrep_usage_take(AuroraTexrepUsageFn fn, void* user, AuroraTexrepUsageTotals* totals) {
+  using namespace aurora::texture;
+  absl::flat_hash_map<uint64_t, UsageRow> rows;
+  AuroraTexrepUsageTotals t{};
+  {
+    std::lock_guard lk(s_registryMutex);
+    rows.swap(s_usageRows);
+    t.residentBytes = s_replacementCacheBytes;
+    t.peakBytes = s_usagePeakBytes;
+    t.budgetBytes = s_cacheBudgetBytes.load(std::memory_order_relaxed);
+    t.evictions = s_usageEvictions;
+    t.totalEvictions = s_totalEvictions;
+    t.residentTextures = static_cast<uint32_t>(s_cacheByKey.size());
+    s_usagePeakBytes = s_replacementCacheBytes;
+    s_usageEvictions = 0;
+  }
+  if (totals != nullptr) {
+    *totals = t;
+  }
+  if (fn == nullptr) {
+    return;
+  }
+  for (const auto& [id, row] : rows) {
+    const AuroraTexrepUsageRow out{
+        .id = id,
+        .name = row.name.c_str(),
+        .width = row.width,
+        .height = row.height,
+        .mips = row.mips,
+        .format = row.format,
+        .bytes = row.bytes,
+        .full = row.full ? 1u : 0u,
+        .loads = row.loads,
+    };
+    fn(user, &out);
+  }
+}

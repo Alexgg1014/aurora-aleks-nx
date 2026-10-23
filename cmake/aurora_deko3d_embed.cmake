@@ -1,0 +1,6 @@
+# aleks2 (deko3d P1): a binary file as a C header (cmake -DIN=<file> -DOUT=<header> -DNAME=<symbol> -P ...)
+file(READ "${IN}" _hex HEX)
+string(LENGTH "${_hex}" _len)
+math(EXPR _size "${_len} / 2")
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _bytes "${_hex}")
+file(WRITE "${OUT}" "#pragma once\n#include <cstddef>\n#include <cstdint>\nalignas(256) static const uint8_t ${NAME}[] = {${_bytes}};\nstatic const size_t ${NAME}_size = ${_size};\n")

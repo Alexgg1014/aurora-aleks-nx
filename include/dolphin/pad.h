@@ -88,6 +88,11 @@ extern "C" {
 #endif
 
 #define PAD_NATIVE_BUTTON_INVALID 0xFFFFFFFF
+/* A PADButtonMapping's nativeButton that is a trigger axis instead of an SDL gamepad button: pressed past
+   half way (SDL_GetGamepadAxis > 16000), e.g. ZL given a digital action.
+   aleks2 (V1): from SwitchWaker v0.5.0 (centollOS/SwitchWaker ee163e8, native/patches/aurora/0022, MIT). */
+#define PAD_NATIVE_TRIGGER_LEFT 0x10000u
+#define PAD_NATIVE_TRIGGER_RIGHT 0x10001u
 
 typedef struct PADStatus {
   u16 button;

@@ -90,6 +90,13 @@ Range push_indices(ArrayRef<T> data, size_t alignment) {
   return push_indices(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T), alignment);
 }
 Range push_uniform(const uint8_t* data, size_t length);
+// aleks2 (FIFO-opt): `length` bytes of the frame's index buffer for the caller to write,
+// at `range` (as push_indices would place them); nullptr outside a recording frame.
+uint8_t* map_indices(size_t length, size_t alignment, Range& range);
+// aleks2 (FIFO-opt): the frame's uniform buffer, padded for a new block as push_uniform
+// pads it; `unpadded` is its size before the padding (truncate back to it to take the
+// block back, padding included). nullptr outside a recording frame.
+ByteBuffer* begin_uniform_block(size_t& unpadded);
 template <typename T>
 Range push_uniform(const T& data) {
   return push_uniform(reinterpret_cast<const uint8_t*>(&data), sizeof(T));

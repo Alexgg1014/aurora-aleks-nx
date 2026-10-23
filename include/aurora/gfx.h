@@ -21,6 +21,12 @@ typedef struct {
   uint32_t createdPipelines;
   uint32_t drawCallCount;
   uint32_t mergedDrawCallCount;
+  uint32_t lastVertSize;
+  uint32_t lastUniformSize;
+  uint32_t lastIndexSize;
+  uint32_t lastStorageSize;
+  uint32_t lastTextureUploadSize;
+  /* aleks2: ours, after upstream's fields (V1-rc4): mods read this struct with upstream's layout. */
   uint32_t bindGroupRebuilds;
   uint32_t pipelineRebuilds;
   uint32_t uniformRebuilds;
@@ -28,11 +34,6 @@ typedef struct {
   uint32_t mergeBlockedPipeline;
   uint32_t mergeBlockedTextures;
   uint32_t mergeBlockedUniformOnly;
-  uint32_t lastVertSize;
-  uint32_t lastUniformSize;
-  uint32_t lastIndexSize;
-  uint32_t lastStorageSize;
-  uint32_t lastTextureUploadSize;
 } AuroraStats;
 
 const AuroraStats* aurora_get_stats();

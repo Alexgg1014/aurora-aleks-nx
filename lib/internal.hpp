@@ -312,6 +312,12 @@ public:
   }
 
   void clear() { m_length = 0; }
+  // aleks2 (FIFO-opt): drops what was appended after `size` (keeps the storage).
+  void truncate(size_t size) noexcept {
+    if (size < m_length) {
+      m_length = size;
+    }
+  }
   void reserve_extra(size_t size) { resize(m_length + size, true); }
 
   ByteBuffer clone() const {

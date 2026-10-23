@@ -11,6 +11,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <atomic>
+#include <unordered_map>
+
+// aleks2 (V1-rc11): EFB copies made, and copies to a destination last used with another size or format (the black
+// ground near Kakariko darkens the minimap in the same frame: two passes sharing a copy is one suspect).
+namespace {
+std::atomic<uint64_t> s_copyCount{0};
+std::atomic<uint64_t> s_copyReshapes{0};
+std::unordered_map<const void*, uint64_t> s_lastCopyShape;  // dest -> width | height << 20 | format << 40
+} // namespace
 
 namespace {
 aurora::Vec2<uint32_t> scale_copy_dst(u32 logicalWidth, u32 logicalHeight) {
@@ -44,6 +54,21 @@ void copy_tex(const void* dest, GXBool clear) noexcept {
       .height = dstHeight,
       .format = texCopyFmt,
   };
+  s_copyCount.fetch_add(1, std::memory_order_relaxed);
+  note_copy_range(dest, g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight, texCopyFmt, dstWidth,
+                  dstHeight);  // V1-rc12
+  {
+    const uint64_t shape = static_cast<uint64_t>(dstWidth) | (static_cast<uint64_t>(dstHeight) << 20) |
+                           (static_cast<uint64_t>(texCopyFmt) << 40);
+    auto [last, inserted] = s_lastCopyShape.try_emplace(dest, shape);
+    if (!inserted && last->second != shape) {
+      s_copyReshapes.fetch_add(1, std::memory_order_relaxed);
+      last->second = shape;
+    }
+    if (s_lastCopyShape.size() > 4096) {
+      s_lastCopyShape.clear();  // a bound, not a cache: only the last shape per destination matters
+    }
+  }
   auto it = g_gxState.copyTextureCache.find(key);
   if (it == g_gxState.copyTextureCache.end()) {
     gfx::TextureHandle handle;
@@ -222,4 +247,13 @@ void GXCopyTex(void* dest, GXBool clear) {
 // TODO GXGetNumXfbLines
 // TODO GXClearBoundingBox
 // TODO GXReadBoundingBox
+}
+
+extern "C" void aurora_gx_copy_stats(uint64_t* copies, uint64_t* reshapes) {
+  if (copies != nullptr) {
+    *copies = s_copyCount.load(std::memory_order_relaxed);
+  }
+  if (reshapes != nullptr) {
+    *reshapes = s_copyReshapes.load(std::memory_order_relaxed);
+  }
 }

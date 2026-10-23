@@ -1,0 +1,1231 @@
+// Adapted from SwitchWaker (MIT), 084291f: switch/deko/aurora/dk_encode.cpp. Changes for Dusklight
+// (aleks2 deko3d P1): RmlUi's draws (dk_rmlui.cpp), no EFB content scale (this Aurora has none), debug
+// markers only with AURORA_GFX_DEBUG_GROUPS, mods' runtime draw types and encoder tasks skipped (logged).
+//
+// Aurora's recorded frame to deko3d commands (dk_gfx.hpp; docs/DEKO3D_MIGRATION_PLAN.md phase 3), on
+// the render worker: the work encoding.cpp gives Dawn, op by op as Aurora seals them.
+//
+// Frame data. Aurora's staging slot is one deko3d block (vertices 5, uniforms 24, indices 2, storage
+// 8, texture uploads 24 MiB at encoding.cpp's offsets) that the FIFO thread writes and the GPU reads
+// in place: storage buffers 0 (vbuf) and 1 (abuf) are those regions with their sizes (the shaders'
+// bounds checks use length()), uniform buffer 0 is the uniform region at each draw's dynamic offset
+// (3840 bytes, both stages), the index buffer the index region at the draw's offset; the 64-byte
+// immediates go to uniform buffer 15 (both stages: 456 fragment shaders read them) by
+// dkCmdBufPushConstants. The slot is reused once the GPU has finished its frame (staging_ready).
+//
+// Passes. Render targets bound from the views' shadows, load-op clears with deko3d's clear commands,
+// then the pass's commands: viewport (reversed Z: depth range 1 - far .. 1 - near, as encoding.cpp),
+// scissor (clamped to the target), GX draws, partial-clear draws. Every pass ends with a Fragments
+// barrier that also invalidates the texture cache (plan section 7.6: one per pass end for now), and
+// is followed by its EFB copy (the copy engine for a same-format copy, else a conversion or blit draw
+// with the fixed shaders), its snapshots and, before it, its palette conversions. Copy-engine work
+// (uploads, copies) sits between Full barriers.
+//
+// State cache. Pipeline state, shaders, viewport, scissor, blend constant, uniform offset, texture
+// handles, index buffer and immediates are bound only when they change within a frame; anything that
+// binds its own state (fixed passes, the present) resets it.
+//
+// The command list goes to the GPU every COS_DK_SUBMIT_DRAWS draws (default 256, 0 = once per
+// frame), as SwitchWakerHD's, so the GPU starts on a frame while the FIFO thread still records it.
+//
+// Depth peek (GXPeekZ, issue #7: the sun's lens flare and glare, the lantern's and the fireflies' glow test
+// the EFB depth at a few points). Aurora's Mac path snapshots the whole depth buffer with a compute pass
+// after the frame's last EFB pass and maps the copy later (depth_peek.cpp); here the frame's last pass,
+// when GXPeekZ asked for a snapshot (depth_peek::take_snapshot_request), copies only the area around the
+// points the game peeked since the last copy (a margin of kPeekMargin logical pixels) with the copy engine
+// into CPU-visible memory, after the pass's barrier. GXPeekZ reads the newest copy whose frame the GPU
+// has finished (swdk::frames_completed, no wait), so the game sees the depth one to two frames late, as on the
+// Mac; it never waits for the GPU. A point outside the copied area reads as no data (0, occluded).
+#include "dk_encode.hpp"
+
+#include "dk_aurora.h"
+
+#include "dk_gfx.hpp"
+
+#include "gfx/clear.hpp"
+#include "gfx/depth_peek.hpp"
+#include "gfx/frame.hpp"
+#include "gfx/pipeline_cache.hpp"
+#include "gfx/resource_cache.hpp"
+#include "gfx/tex_copy_conv.hpp"
+#include "gfx/tex_palette_conv.hpp"
+#include "gfx/texture.hpp"
+#include "gx/gx.hpp"
+#include "gx/pipeline.hpp"
+#include "webgpu/gpu.hpp"
+#include "webgpu/gpu_timing.hpp"
+
+#include <algorithm>
+#include <climits>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+namespace aurora::gfx::dk {
+using namespace aurora::gfx::detail;
+using swdk::dklog;
+using swdk::R;
+
+namespace {
+
+// Aurora's staging layout (encoding.cpp)
+constexpr uint64_t kVertexOffset = 0;
+constexpr uint64_t kUniformOffset = kVertexOffset + VertexBufferSize;
+constexpr uint64_t kIndexOffset = kUniformOffset + UniformBufferSize;
+constexpr uint64_t kStorageOffset = kIndexOffset + IndexBufferSize;
+constexpr uint64_t kTextureUploadOffset = kStorageOffset + StorageBufferSize;
+constexpr uint32_t kImmediatesSize = 256;  // the uniform buffer 15 region (64 bytes used)
+
+struct Staging {
+    swdk::Block block;
+    std::atomic<uint64_t> frame{0};  // the last frame that read it
+};
+Staging g_staging[StagingBufferCount];
+
+struct FrameState {
+    bool open = false;
+    DkGpuAddr staging = 0;
+    // aleks2 (V1, COS_DK_CACHED_UPLOAD): how far each staging region (vertices, uniforms, indices, storage, uploads)
+    // has been cleaned from the CPU cache this frame
+    uint32_t cleaned[5] = {};
+    size_t uploadsDone = 0;
+    DkGpuAddr immediates = 0;
+    uint32_t drawsSinceSubmit = 0;
+    bool workSinceTransfer = false;
+} g_frame;
+
+struct Cache {
+    bool globals = false;
+    const Pipe* pipe = nullptr;
+    const DkShader* vs = nullptr;
+    const DkShader* fs = nullptr;
+    bool rsValid = false, csValid = false, cwValid = false, bsValid = false, dsValid = false, biasValid = false;
+    DkRasterizerState rs{};
+    DkColorState cs{};
+    DkColorWriteState cw{};
+    DkBlendState bs{};
+    DkDepthStencilState ds{};
+    float bias[3] = {};
+    bool vpValid = false, scValid = false, blendValid = false, immValid = false;
+    DkViewport vp{};
+    DkScissor sc{};
+    float blend[4] = {};
+    uint8_t imm[64] = {};
+    WGPUBindGroup textures = nullptr;
+    DkGpuAddr ubo = 0;
+    DkGpuAddr idx = 0;
+} g_cache;
+
+EncodeStats g_stats;
+uint32_t g_submitDraws = 256;
+
+// ---- GPU timestamps: every frame, at its start, the end of every pass and copy, the present and
+// ImGui; read when the frame's slot comes round again (its fence waited for)
+constexpr uint32_t kMaxMarks = swdk::kQuerySize / swdk::kFrames / 16;
+struct Marks {
+    GpuWork work[kMaxMarks];
+    uint16_t group[kMaxMarks];  // the GPU group of the segment that ends at each mark
+    uint32_t draws[kMaxMarks];  // its draws
+    uint32_t count = 0;
+    uint64_t cpuNs = 0;  // when the frame was opened
+};
+Marks g_marks[swdk::kFrames];
+// aleks2 (V1-rc16): a timestamp per pass, copy and conversion only while something reads them (benchmark/tour,
+// stress, DRS Auto, perf-lab gpu_timing=always: aurora_gpu_timing_set_enabled), decided once per frame; release
+// play writes none. COS_DK_GPU_TIMERS=0 still turns them off for good. Idea from Chansey's sa2-nx (our own code).
+bool g_gpuTimersAllowed = true;
+bool g_gpuTimers = false;
+
+// ---- GPU time per group (the perf-switch "gpu groups" line; dawn-switch-gl-gpu-groups.patch is the GL
+// NRO's): a group is the frame's last GX debug marker (the native port inserts one per draw-list bucket
+// with COS_GPU_GROUPS=1, per J3D material with =2), or before the frame's first marker the render pass's
+// label; the other segments are named by their kind ("copies", "conversions", "present", "imgui").
+// Running totals by group id, read by aurora_switch_dk_gpu_groups.
+constexpr size_t kMaxGroups = 512;
+std::mutex g_groupMutex;
+std::vector<AuroraSwitchGpuGroup> g_groups;                // guarded by g_groupMutex; id 0 "(none)"
+std::unordered_map<std::string, uint16_t> g_groupIds;     // render worker
+uint16_t g_frameMarker = 0;  // the frame's last marker's group, 0 before its first
+uint16_t g_openGroup = 0;    // the group of the EFB segment being recorded
+uint64_t g_segDrawsStart = 0;
+
+uint16_t intern_group(std::string_view name) {
+    if (name.empty()) name = "(unlabelled)";
+    const std::string key(name);
+    if (auto it = g_groupIds.find(key); it != g_groupIds.end()) return it->second;
+    std::lock_guard<std::mutex> lock(g_groupMutex);
+    if (g_groups.empty()) g_groups.push_back(AuroraSwitchGpuGroup{"(none)", 0, 0, 0});
+    if (g_groups.size() >= kMaxGroups) return 0;
+    AuroraSwitchGpuGroup total{};
+    const size_t n = std::min(name.size(), sizeof(total.name) - 1);
+    memcpy(total.name, name.data(), n);
+    total.name[n] = '\0';
+    const uint16_t id = uint16_t(g_groups.size());
+    g_groups.push_back(total);
+    g_groupIds.emplace(key, id);
+    return id;
+}
+
+uint16_t work_group(GpuWork work) {
+    static const uint16_t ids[] = {
+        intern_group("(frame start)"), 0, intern_group("conversions"), intern_group("copies"),
+        intern_group("present"),       intern_group("imgui"), intern_group("other"),
+    };
+    return work == GpuWork::Efb ? g_openGroup : ids[size_t(work)];
+}
+
+// the GPU's timer against the CPU's (SwitchWakerHD backend.cpp GpuClock): deko3d's dkTimestampToNs
+// assumes 31.25 MHz, the Tegra X1's runs at 19.2 MHz; measured over the session from the frames' first
+// timestamps and the CPU time of their start
+struct GpuClock {
+    bool have = false, logged = false;
+    uint64_t cpu0 = 0, gpu0 = 0;
+    double factor = 31.25 / 19.2;
+    void sample(uint64_t cpuNs, uint64_t gpuNs) {
+        if (!have) {
+            have = true;
+            cpu0 = cpuNs;
+            gpu0 = gpuNs;
+            return;
+        }
+        if (gpuNs <= gpu0 || cpuNs - cpu0 < 4'000'000'000ull) return;
+        factor = double(cpuNs - cpu0) / double(gpuNs - gpu0);
+        if (!logged && cpuNs - cpu0 > 30'000'000'000ull) {
+            logged = true;
+            dklog("GPU timer: %.4f real ns per deko3d ns (measured over %.0f s); the GPU times are real time", factor,
+                  double(cpuNs - cpu0) / 1e9);
+        }
+    }
+} g_clock;
+
+void read_marks(uint64_t frame) {
+    Marks& m = g_marks[frame % swdk::kFrames];
+    if (m.count >= 2) {
+        const swdk::QueryRegion q = swdk::query_region(frame);
+        uint64_t ts[kMaxMarks];
+        for (uint32_t i = 0; i < m.count; i++) memcpy(&ts[i], q.cpu + size_t(i) * 16 + 8, 8);
+        g_clock.sample(m.cpuNs, dkTimestampToNs(ts[0]));
+        bool ok = true;
+        for (uint32_t i = 1; i < m.count && ok; i++) ok = ts[i] >= ts[i - 1];
+        if (ok) {
+            for (uint32_t i = 1; i < m.count; i++)
+                g_stats.gpuNs[size_t(m.work[i])] += uint64_t(double(dkTimestampToNs(ts[i] - ts[i - 1])) * g_clock.factor);
+            g_stats.gpuTotalNs += uint64_t(double(dkTimestampToNs(ts[m.count - 1] - ts[0])) * g_clock.factor);
+            g_stats.gpuFrames++;
+            std::lock_guard<std::mutex> lock(g_groupMutex);
+            for (uint32_t i = 1; i < m.count; i++) {
+                if (m.group[i] >= g_groups.size()) continue;
+                AuroraSwitchGpuGroup& g = g_groups[m.group[i]];
+                g.ns += uint64_t(double(dkTimestampToNs(ts[i] - ts[i - 1])) * g_clock.factor);
+                g.segments++;
+                g.draws += m.draws[i];
+            }
+        } else {
+            g_stats.gpuDropped++;
+        }
+    }
+    m.count = 0;
+}
+
+void barrier(DkBarrier mode, uint32_t invalidate) {
+    dkCmdBufBarrier(R.cmd, mode, invalidate);
+    g_stats.barriers++;
+}
+
+void transfer_begin() {
+    if (g_frame.workSinceTransfer) barrier(DkBarrier_Full, DkInvalidateFlags_Image);
+    g_frame.workSinceTransfer = false;
+}
+void transfer_end() { barrier(DkBarrier_Full, DkInvalidateFlags_Image); }
+
+void set_swizzle(bool flip) {
+    const DkViewportSwizzle sw = {DkSwizzle_PositiveX, flip ? DkSwizzle_NegativeY : DkSwizzle_PositiveY,
+                                  DkSwizzle_PositiveZ, DkSwizzle_PositiveW};
+    dkCmdBufSetViewportSwizzles(R.cmd, 0, &sw, 1);
+}
+
+// the frame-wide bindings of GX draws
+void ensure_globals() {
+    if (g_cache.globals) return;
+    const DkGpuAddr s = g_frame.staging;
+    dkCmdBufBindStorageBuffer(R.cmd, DkStage_Vertex, 0, s + kVertexOffset, uint32_t(VertexBufferSize));
+    dkCmdBufBindStorageBuffer(R.cmd, DkStage_Vertex, 1, s + kStorageOffset, uint32_t(StorageBufferSize));
+    dkCmdBufBindStorageBuffer(R.cmd, DkStage_Fragment, 1, s + kStorageOffset, uint32_t(StorageBufferSize));
+    dkCmdBufBindUniformBuffer(R.cmd, DkStage_Vertex, swdk::kImmediatesUboSlot, g_frame.immediates, kImmediatesSize);
+    dkCmdBufBindUniformBuffer(R.cmd, DkStage_Fragment, swdk::kImmediatesUboSlot, g_frame.immediates, kImmediatesSize);
+    dkCmdBufBindVtxAttribState(R.cmd, nullptr, 0);
+    dkCmdBufBindVtxBufferState(R.cmd, nullptr, 0);
+    set_swizzle(swdk::C.flipY);
+    g_cache.globals = true;
+}
+
+template <class T> bool changed(bool& valid, T& cached, const T& now) {
+    if (valid && memcmp(&cached, &now, sizeof now) == 0) return false;
+    cached = now;
+    valid = true;
+    return true;
+}
+
+void bind_pipe(const Pipe* p) {
+    if (g_cache.pipe == p) return;
+    const DkShader* vs = &p->vs->shader;
+    const DkShader* fs = &p->fs->shader;
+    if (vs != g_cache.vs || fs != g_cache.fs) {
+        if (swdk::code_take_written()) dkCmdBufBarrier(R.cmd, DkBarrier_None, DkInvalidateFlags_Shader);
+        const DkShader* sh[] = {vs, fs};
+        dkCmdBufBindShaders(R.cmd, DkStageFlag_GraphicsMask, sh, 2);
+        g_cache.vs = vs;
+        g_cache.fs = fs;
+        g_stats.shaderBinds++;
+    }
+    if (changed(g_cache.rsValid, g_cache.rs, p->rasterizer)) dkCmdBufBindRasterizerState(R.cmd, &p->rasterizer);
+    if (changed(g_cache.csValid, g_cache.cs, p->color)) dkCmdBufBindColorState(R.cmd, &p->color);
+    if (changed(g_cache.cwValid, g_cache.cw, p->colorWrite)) dkCmdBufBindColorWriteState(R.cmd, &p->colorWrite);
+    if (changed(g_cache.bsValid, g_cache.bs, p->blend)) dkCmdBufBindBlendStates(R.cmd, 0, &p->blend, 1);
+    if (changed(g_cache.dsValid, g_cache.ds, p->depthStencil)) dkCmdBufBindDepthStencilState(R.cmd, &p->depthStencil);
+    if (p->rasterizer.depthBiasEnableMask) {
+        float bias[3];
+        memcpy(bias, p->depthBias, sizeof bias);
+        if (!g_cache.biasValid || memcmp(g_cache.bias, bias, sizeof bias) != 0) {
+            dkCmdBufSetDepthBias(R.cmd, bias[0], bias[1], bias[2]);
+            memcpy(g_cache.bias, bias, sizeof bias);
+            g_cache.biasValid = true;
+        }
+    }
+    g_cache.pipe = p;
+    g_stats.pipelineBinds++;
+}
+
+void set_blend_const(float r, float g, float b, float a) {
+    const float c[4] = {r, g, b, a};
+    if (g_cache.blendValid && memcmp(g_cache.blend, c, sizeof c) == 0) return;
+    dkCmdBufSetBlendConst(R.cmd, r, g, b, a);
+    memcpy(g_cache.blend, c, sizeof c);
+    g_cache.blendValid = true;
+}
+
+void apply_viewport(const Viewport& vp) {
+    if (!(vp.width > 0.f) || !(vp.height > 0.f)) return;  // (deko3d's viewport size is unsigned)
+    const float minDepth = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
+    const float maxDepth = gx::UseReversedZ ? 1.f - vp.znear : vp.zfar;
+    const DkViewport v = {vp.left, vp.top, vp.width, vp.height, minDepth, maxDepth};
+    if (changed(g_cache.vpValid, g_cache.vp, v)) dkCmdBufSetViewports(R.cmd, 0, &v, 1);
+}
+
+void apply_scissor(const ClipRect& sc, uint32_t tw, uint32_t th) {
+    const auto x = std::clamp(static_cast<uint32_t>(std::max(sc.x, 0)), 0u, tw);
+    const auto y = std::clamp(static_cast<uint32_t>(std::max(sc.y, 0)), 0u, th);
+    const auto w = std::clamp(static_cast<uint32_t>(std::max(sc.width, 0)), 0u, tw - x);
+    const auto h = std::clamp(static_cast<uint32_t>(std::max(sc.height, 0)), 0u, th - y);
+    const DkScissor s = {x, y, w, h};
+    if (changed(g_cache.scValid, g_cache.sc, s)) dkCmdBufSetScissors(R.cmd, 0, &s, 1);
+}
+
+void maybe_submit() {
+    if (g_submitDraws == 0 || ++g_frame.drawsSinceSubmit < g_submitDraws) return;
+    g_frame.drawsSinceSubmit = 0;
+    swdk::submit("draws");
+    g_stats.submits++;
+}
+
+void log_once(const char* what) {
+    static std::vector<std::string> seen;
+    for (auto& s : seen)
+        if (s == what) return;
+    seen.emplace_back(what);
+    dklog("encoder: %s (not supported by the deko3d renderer yet; logged once)", what);
+}
+
+Tex* g_passDepth = nullptr;  // the current pass's depth target (COS_DK_DUMP_DEPTH)
+Tex* g_passColor = nullptr;  // its colour attachment 0 (COS_DK_DUMP_COLOR)
+
+// COS_DK_DUMP_COLOR=<module hex> (diagnostic): before the first draw of that module (from COS_DK_TRACE_FRAME on),
+// the pass's colour attachment 0 is written raw (RGBA8) to native/trace_color_<w>x<h>.raw
+void dump_color(uint64_t module) {
+    static const uint64_t want = [] {
+        const char* e = getenv("COS_DK_DUMP_COLOR");
+        return e && *e ? strtoull(e, nullptr, 16) : 0ull;
+    }();
+    static const long minFrame = swdk::env_long("COS_DK_TRACE_FRAME", 0);
+    // every draw of the module in the first frame that has one (from COS_DK_TRACE_FRAME on), up to 16 files
+    static long seen = 0;
+    static uint64_t frame = 0;
+    if (!want || module != want || !g_passColor || R.frame < uint64_t(std::max(minFrame, 0L))) return;
+    if (frame == 0) frame = R.frame;
+    if (R.frame != frame || seen >= 16) return;
+    const long nth = ++seen;
+    // what the pass drew so far: finished and out of the render target caches before the copy reads it
+    dkCmdBufBarrier(R.cmd, DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_L2Cache);
+    std::vector<uint8_t> px;
+    uint32_t w = 0, h = 0;
+    wgpu::TextureFormat fmt{};
+    if (!read_texture(g_passColor->handle, px, w, h, fmt)) return;
+    char path[160];
+    snprintf(path, sizeof path, "/switch/switchwaker/native/trace_color_%ux%u_%02ld.raw", w, h, nth);
+    if (FILE* f = fopen(path, "wb")) {
+        fwrite(px.data(), 1, px.size(), f);
+        fclose(f);
+        dklog("trace: colour target (%s) written to %s", g_passColor->label.c_str(), path);
+    }
+}
+
+// COS_DK_DUMP_DEPTH=<module hex> (diagnostic): before the first draw of that module, the pass's depth buffer is
+// written raw to native/trace_depth_<w>x<h>_<fmt>.raw
+void dump_depth(uint64_t module) {
+    static const uint64_t want = [] {
+        const char* e = getenv("COS_DK_DUMP_DEPTH");
+        return e && *e ? strtoull(e, nullptr, 16) : 0ull;
+    }();
+    static bool done = false;
+    static const long minFrame = swdk::env_long("COS_DK_TRACE_FRAME", 0);  // (not before that frame)
+    if (!want || done || module != want || !g_passDepth || R.frame < uint64_t(std::max(minFrame, 0L))) return;
+    done = true;
+    std::vector<uint8_t> px;
+    uint32_t w = 0, h = 0;
+    wgpu::TextureFormat fmt{};
+    if (!read_texture(g_passDepth->handle, px, w, h, fmt)) return;
+    char path[160];
+    snprintf(path, sizeof path, "/switch/switchwaker/native/trace_depth_%ux%u_%d.raw", w, h, int(g_passDepth->format));
+    if (FILE* f = fopen(path, "wb")) {
+        fwrite(px.data(), 1, px.size(), f);
+        fclose(f);
+        dklog("trace: depth buffer (%s) written to %s", g_passDepth->label.c_str(), path);
+    }
+}
+
+// COS_DK_TRACE_FRAME=N (diagnostic): every GX draw of frame N logged, one line each (module, blend, the units with
+// a real texture); COS_DK_SKIP_MODULE=<hex>[,<hex>...]: the draws of those modules are not drawn
+bool trace_frame_now() {
+    static const long n = swdk::env_long("COS_DK_TRACE_FRAME", 0);
+    static const bool dumpOnly = (getenv("COS_DK_DUMP_DEPTH") && *getenv("COS_DK_DUMP_DEPTH")) ||
+                                 (getenv("COS_DK_DUMP_COLOR") && *getenv("COS_DK_DUMP_COLOR"));
+    return n > 0 && !dumpOnly && R.frame == uint64_t(n);
+}
+bool skip_module(uint64_t module) {
+    static const std::vector<uint64_t> list = [] {
+        std::vector<uint64_t> v;
+        if (const char* e = getenv("COS_DK_SKIP_MODULE"); e && *e) {
+            for (const char* p = e; *p;) {
+                char* end = nullptr;
+                v.push_back(strtoull(p, &end, 16));
+                if (!end || end == p) break;
+                p = *end == ',' ? end + 1 : end;
+            }
+            dklog("encoder: COS_DK_SKIP_MODULE: %zu modules not drawn", v.size());
+        }
+        return v;
+    }();
+    return std::find(list.begin(), list.end(), module) != list.end();
+}
+void trace_draw(const gx::DrawData& d, const Pipe* main, BindGroup* g) {
+    static uint32_t index = 0;
+    char units[256];
+    size_t n = 0;
+    units[0] = 0;
+    if (g) {
+        for (const auto& e : g->entries) {
+            if (e.binding & 1 || e.binding / 2 >= 8 || !e.view || !e.view->tex) continue;
+            const Tex* t = e.view->tex;
+            if (t->width * t->height <= 1) continue;
+            n += size_t(snprintf(units + n, sizeof units - n, " u%u:%ux%u%s", e.binding / 2, t->width, t->height,
+                                 t->label == "Resolved Texture" ? "(copy)" : ""));
+            if (n >= sizeof units) break;
+        }
+    }
+    const DkBlendState& bl = main->blend;
+    const auto& rs = main->rasterizer;
+    dklog("trace frame %llu draw %u: module %016llx blend %d/%d/%d a %d/%d/%d mask 0x%x depth %d/%d op %d cull %d front %d "
+          "bias 0x%x %.2f/%.2f/%.2f clamp %d %u idx %u vtx%s",
+          (unsigned long long)R.frame, index++, (unsigned long long)main->moduleHash, int(bl.colorBlendOp),
+          int(bl.srcColorBlendFactor), int(bl.dstColorBlendFactor), int(bl.alphaBlendOp), int(bl.srcAlphaBlendFactor),
+          int(bl.dstAlphaBlendFactor), unsigned(main->colorWrite.masks & 0xF), int(main->depthStencil.depthTestEnable),
+          int(main->depthStencil.depthWriteEnable), int(main->depthStencil.depthCompareOp), int(rs.cullMode),
+          int(rs.frontFace), unsigned(rs.depthBiasEnableMask), main->depthBias[0], main->depthBias[1], main->depthBias[2],
+          int(rs.depthClampEnable), d.indexCount, d.vtxCount, units);
+}
+
+// ---- draws
+void draw_gx(const DrawCommand& cmd) {
+    gx::DrawData d;
+    memcpy(&d, cmd.payload.data(), sizeof d);
+    CompiledPipeline cp;
+    if (!get_pipeline(d.pipeline, cp)) {
+        g_stats.skippedPipeline++;
+        return;
+    }
+    const auto* main = static_cast<const Pipe*>(cp.dkMain);
+    const auto* pre = static_cast<const Pipe*>(cp.dkPrepass);
+    if (!pipe_ready(main) || (pre && !pipe_ready(pre))) {
+        g_stats.skippedShader++;
+        return;
+    }
+    if (trace_frame_now()) {
+        WGPUBindGroup tg = d.bindGroups.textureBindGroup ? find_bind_group_raw(d.bindGroups.textureBindGroup) : nullptr;
+        trace_draw(d, main, tg ? find_bind_group(tg) : nullptr);
+    }
+    if (skip_module(main->moduleHash)) return;
+    dump_depth(main->moduleHash);
+    dump_color(main->moduleHash);
+    ensure_globals();
+    if (!g_cache.immValid || memcmp(g_cache.imm, &d.immediateData, sizeof d.immediateData) != 0) {
+        dkCmdBufPushConstants(R.cmd, g_frame.immediates, kImmediatesSize, 0, sizeof d.immediateData, &d.immediateData);
+        memcpy(g_cache.imm, &d.immediateData, sizeof d.immediateData);
+        g_cache.immValid = true;
+    }
+    const DkGpuAddr ubo = g_frame.staging + kUniformOffset + d.uniformRange.offset;
+    if (ubo != g_cache.ubo) {
+        dkCmdBufBindUniformBuffer(R.cmd, DkStage_Vertex, 0, ubo, gx::MaxUniformSize);
+        dkCmdBufBindUniformBuffer(R.cmd, DkStage_Fragment, 0, ubo, gx::MaxUniformSize);
+        g_cache.ubo = ubo;
+        g_stats.uniformBinds++;
+    }
+    if (d.bindGroups.textureBindGroup) {
+        // (without one the draw keeps the textures bound before, as in the WebGPU pass)
+        WGPUBindGroup g = find_bind_group_raw(d.bindGroups.textureBindGroup);
+        if (g && g != g_cache.textures) {
+            if (BindGroup* sg = find_bind_group(g)) {
+                dkCmdBufBindTextures(R.cmd, DkStage_Fragment, 0, gx_handles(sg), 8);
+                g_stats.textureBinds++;
+            }
+            g_cache.textures = g;
+        }
+    }
+    if (d.dstAlpha != UINT32_MAX) set_blend_const(0.f, 0.f, 0.f, float(d.dstAlpha) / 255.f);
+    if (d.indexCount != 0) {
+        const DkGpuAddr idx = g_frame.staging + kIndexOffset + d.idxRange.offset;
+        if (idx != g_cache.idx) {
+            dkCmdBufBindIdxBuffer(R.cmd, DkIdxFormat_Uint16, idx);
+            g_cache.idx = idx;
+        }
+    }
+    const auto draw = [&] {
+        // first vertex and first instance 0: gl_VertexID / gl_InstanceID are WebGPU's indices then
+        if (d.indexCount == 0) {
+            dkCmdBufDraw(R.cmd, DkPrimitive_Triangles, d.vtxCount, d.instanceCount, 0, 0);
+        } else {
+            dkCmdBufDrawIndexed(R.cmd, DkPrimitive_Triangles, d.indexCount, d.instanceCount, 0, 0, 0);
+        }
+    };
+    if (pre) {
+        bind_pipe(pre);
+        draw();
+    }
+    bind_pipe(main);
+    draw();
+    g_stats.draws++;
+    g_frame.workSinceTransfer = true;
+    maybe_submit();
+}
+
+void draw_clear(const DrawCommand& cmd, uint32_t tw, uint32_t th) {
+    clear::DrawData d;
+    memcpy(&d, cmd.payload.data(), sizeof d);
+    CompiledPipeline cp;
+    if (!get_pipeline(d.pipeline, cp)) {
+        g_stats.skippedPipeline++;
+        return;
+    }
+    const auto* p = static_cast<const Pipe*>(cp.dkMain);
+    if (!pipe_ready(p)) {
+        g_stats.skippedShader++;
+        return;
+    }
+    ensure_globals();
+    bind_pipe(p);
+    set_blend_const(float(d.color.r), float(d.color.g), float(d.color.b), float(d.color.a));
+    // clear.cpp: the whole target, depth range [depth, depth] (the value written), the clear's scissor
+    const DkViewport v = {0.f, 0.f, float(tw), float(th), d.depth, d.depth};
+    dkCmdBufSetViewports(R.cmd, 0, &v, 1);
+    g_cache.vpValid = false;
+    const DkScissor s = {uint32_t(std::max(d.rect.x, 0)), uint32_t(std::max(d.rect.y, 0)),
+                         uint32_t(std::max(d.rect.width, 0)), uint32_t(std::max(d.rect.height, 0))};
+    dkCmdBufSetScissors(R.cmd, 0, &s, 1);
+    g_cache.scValid = false;
+    dkCmdBufDraw(R.cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
+    g_stats.clears++;
+    g_frame.workSinceTransfer = true;
+}
+
+// ---- uploads and copies (copy engine)
+uint32_t level_size(uint32_t size, uint32_t level) { return std::max(size >> level, 1u); }
+
+void upload(const TextureUpload& u) {
+    Tex* t = find_texture(u.tex.texture.Get());
+    if (!t || !t->valid) return;
+    if (u.buffer && !u.dkGpu) {
+        log_once("a texture upload from a WebGPU buffer");
+        return;
+    }
+    const uint32_t mip = u.tex.mipLevel;
+    if (mip >= t->mips) return;
+    const DkGpuAddr src = u.dkGpu ? u.dkGpu : g_frame.staging + kTextureUploadOffset + u.layout.offset;
+    const uint32_t rowBytes = (u.layout.bytesPerRow + 255u) & ~255u;
+    const uint32_t rows = u.layout.rowsPerImage ? u.layout.rowsPerImage : 1;
+    const DkCopyBuf buf = {src, rowBytes, rowBytes * rows};
+    const DkImageView view = level_view(t, mip);
+    const uint32_t w = std::min(u.size.width, level_size(t->width, mip) - std::min(u.tex.origin.x, level_size(t->width, mip)));
+    const uint32_t h =
+        std::min(u.size.height, level_size(t->height, mip) - std::min(u.tex.origin.y, level_size(t->height, mip)));
+    if (w == 0 || h == 0) return;
+    const DkImageRect rect = {u.tex.origin.x, u.tex.origin.y, u.tex.origin.z, w, h,
+                              std::max<uint32_t>(u.size.depthOrArrayLayers, 1)};
+    dkCmdBufCopyBufferToImage(R.cmd, &buf, &view, &rect, swdk::C.flipTexture ? uint32_t(DkBlitFlag_FlipY) : 0u);
+    if (u.dkBlock) swdk::block_free_deferred(static_cast<DkMemBlock>(u.dkBlock));
+    g_stats.uploads++;
+    g_stats.uploadBytes += uint64_t(rowBytes) * rows;
+}
+
+void do_uploads(const FrameOp& op) {
+    if (op.textureUploads.size() <= g_frame.uploadsDone) return;
+    transfer_begin();
+    for (size_t i = g_frame.uploadsDone; i < op.textureUploads.size(); i++) upload(*op.textureUploads[i]);
+    g_frame.uploadsDone = op.textureUploads.size();
+    transfer_end();
+    gpu_mark(GpuWork::Copy);
+}
+
+void copy_image(Tex* src, uint32_t srcMip, uint32_t sx, uint32_t sy, Tex* dst, uint32_t dstMip, uint32_t dx,
+                uint32_t dy, uint32_t w, uint32_t h) {
+    if (!src || !dst || !src->valid || !dst->valid) {
+        log_once(!src || !dst ? "an image copy whose texture has no deko3d shadow (skipped)"
+                              : "an image copy whose texture has no deko3d image (skipped)");
+        g_stats.skippedOther++;
+        return;
+    }
+    if (src->format != dst->format && format_info(src->wformat).blockBytes != format_info(dst->wformat).blockBytes) {
+        log_once("an image copy between formats of different sizes");
+        return;
+    }
+    const uint32_t sw = level_size(src->width, srcMip), shh = level_size(src->height, srcMip);
+    const uint32_t dw = level_size(dst->width, dstMip), dh = level_size(dst->height, dstMip);
+    if (sx >= sw || sy >= shh || dx >= dw || dy >= dh) return;
+    w = std::min({w, sw - sx, dw - dx});
+    h = std::min({h, shh - sy, dh - dy});
+    if (w == 0 || h == 0) return;
+    if (src->compressed) {
+        // dkCmdBufCopyImage takes compressed rectangles in blocks (SwitchWakerHD surfaces.cpp)
+        w = (w + src->blockW - 1) / src->blockW;
+        h = (h + src->blockH - 1) / src->blockH;
+        sx /= src->blockW;
+        sy /= src->blockH;
+        dx /= dst->blockW;
+        dy /= dst->blockH;
+    }
+    transfer_begin();
+    const DkImageView sv = level_view(src, srcMip), dv = level_view(dst, dstMip);
+    const DkImageRect sr = {sx, sy, 0, w, h, 1}, dr = {dx, dy, 0, w, h, 1};
+    dkCmdBufCopyImage(R.cmd, &sv, &sr, &dv, &dr, 0);
+    transfer_end();
+    g_stats.copies++;
+    gpu_mark(GpuWork::Copy);
+}
+
+// ---- conversions (draws with the fixed shaders)
+const char* copy_conv_module(GXTexFmt fmt) {
+    switch (fmt) {
+    case GX_TF_I4: return "tex_copy_conv_i4";
+    case GX_TF_I8: return "tex_copy_conv_i8";
+    case GX_TF_IA4: return "tex_copy_conv_ia4";
+    case GX_TF_IA8: return "tex_copy_conv_ia8";
+    case GX_TF_RGB565: return "tex_copy_conv_rgb565";
+    case GX_CTF_R4: return "tex_copy_conv_r4";
+    case GX_CTF_RA4: return "tex_copy_conv_ra4";
+    case GX_CTF_RA8: return "tex_copy_conv_ra8";
+    case GX_CTF_A8: return "tex_copy_conv_a8";
+    case GX_CTF_R8: return "tex_copy_conv_r8";
+    case GX_CTF_G8: return "tex_copy_conv_g8";
+    case GX_CTF_B8: return "tex_copy_conv_b8";
+    case GX_CTF_RG8: return "tex_copy_conv_rg8";
+    case GX_CTF_GB8: return "tex_copy_conv_gb8";
+    case GX_TF_Z8: return "tex_copy_conv_z8";
+    case GX_TF_Z16: return "tex_copy_conv_z16";
+    default: return nullptr;
+    }
+}
+
+DkImageView target_view(View* v) { return level_view(v->tex, v->baseMip); }
+
+void convert_copy(GXTexFmt fmt, bool blit, const wgpu::TextureView& srcView, Range uniforms, const TextureHandle& dst,
+                  bool linear) {
+    const bool depth = !blit && gx::is_depth_format(fmt);
+    const char* module = blit ? "tex_copy_conv_blit" : copy_conv_module(fmt);
+    if (!module) {
+        log_once("an EFB copy conversion of a format without a fixed shader");
+        return;
+    }
+    View* src = find_view(srcView.Get());
+    View* out = find_view(dst->attachmentTextureView.Get());
+    if (!src || !out || !out->tex->valid) {
+        // aleks2 (deko3d P3): every silent skip of the copy path says why (once per reason and format)
+        char what[200];
+        snprintf(what, sizeof what, "EFB copy %s (GX format %d) skipped: %s", module, int(fmt),
+                 !src ? "its source view has no deko3d shadow"
+                 : !out ? "its destination view has no deko3d shadow"
+                        : "its destination texture has no deko3d image (format unsupported)");
+        log_once(what);
+        g_stats.skippedOther++;
+        return;
+    }
+    const DkImageView target = target_view(out);
+    // tex_copy_conv's bindings: colour (sampler 0, texture 1, uniforms 2), depth (texture 0, uniforms 1)
+    const FixedBind binds[] = {
+        {swdk::SlotBinding::Kind::Uniform, depth ? 1u : 2u, 0, g_frame.staging + kUniformOffset + uniforms.offset,
+         std::max<uint32_t>((uniforms.size + 15u) & ~15u, 16u)},
+        {swdk::SlotBinding::Kind::Sampler, depth ? 0u : 1u,
+         dkMakeTextureHandle(view_slot(src), linear ? swdk::kSamplerLinearClamp : swdk::kSamplerNearestClamp)},
+    };
+    if (fixed_draw(module, "vs_main", "fs_main", &target, out->tex->width, out->tex->height, true, binds, 2)) {
+        g_stats.conversions++;
+        gpu_mark(GpuWork::Conversion);
+    }
+}
+
+void palette_conv(const tex_palette_conv::ConvRequest& req) {
+    const char* module = req.variant == tex_palette_conv::Variant::Direct       ? "tex_palette_conv_direct"
+                         : req.variant == tex_palette_conv::Variant::FromFloat8 ? "tex_palette_conv_fromfloat8"
+                                                                                : "tex_palette_conv_fromfloat4";
+    if (!req.src || !req.dst || !req.tlut) {
+        log_once("a palette conversion without its source, TLUT or destination (skipped)");
+        return;
+    }
+    View* src = find_view(req.src->sampleTextureView.Get());
+    View* tlut = find_view(req.tlut->sampleTextureView.Get());
+    View* out = find_view(req.dst->attachmentTextureView.Get());
+    if (!src || !tlut || !out || !out->tex->valid) {
+        char what[200];
+        snprintf(what, sizeof what, "palette conversion %s skipped: %s", module,
+                 !src ? "the index texture's view has no deko3d shadow"
+                 : !tlut ? "the TLUT's view has no deko3d shadow"
+                 : !out  ? "the destination view has no deko3d shadow"
+                         : "the destination texture has no deko3d image");
+        log_once(what);
+        g_stats.skippedOther++;
+        return;
+    }
+    {
+        // aleks2 (deko3d P3): each kind of palette conversion once, with what it reads and writes
+        static std::vector<uint64_t> seen;
+        const uint64_t key = (uint64_t(req.variant) << 48) ^ (uint64_t(src->tex->wformat) << 32) ^
+                             (uint64_t(tlut->tex->wformat) << 16) ^ uint64_t(out->tex->wformat);
+        if (seen.size() < 64 && std::find(seen.begin(), seen.end(), key) == seen.end()) {
+            seen.push_back(key);
+            dklog("palette conversion %s: index %ux%u format 0x%X (view mips %u+%u), TLUT %ux%u format 0x%X, into "
+                  "%ux%u format 0x%X",
+                  module, src->tex->width, src->tex->height, unsigned(src->tex->wformat), src->baseMip,
+                  src->mipCount, tlut->tex->width, tlut->tex->height, unsigned(tlut->tex->wformat),
+                  out->tex->width, out->tex->height, unsigned(out->tex->wformat));
+        }
+    }
+    const DkImageView target = target_view(out);
+    const FixedBind binds[] = {
+        {swdk::SlotBinding::Kind::Sampler, 1, dkMakeTextureHandle(view_slot(src), swdk::kSamplerNearestClamp)},
+        {swdk::SlotBinding::Kind::Sampler, 2, dkMakeTextureHandle(view_slot(tlut), swdk::kSamplerNearestClamp)},
+    };
+    if (fixed_draw(module, "vs_main", "fs_main", &target, out->tex->width, out->tex->height, true, binds, 2)) {
+        g_stats.conversions++;
+        gpu_mark(GpuWork::Conversion);
+    }
+}
+
+void depth_snapshot(const wgpu::TextureView& srcDepth, uint32_t samples, const wgpu::TextureView& dst) {
+    View* src = find_view(srcDepth.Get());
+    View* out = find_view(dst.Get());
+    if (!src || !out || !out->tex->valid) return;
+    const DkImageView target = target_view(out);
+    const FixedBind binds[] = {
+        {swdk::SlotBinding::Kind::Sampler, 0, dkMakeTextureHandle(view_slot(src), swdk::kSamplerNearestClamp)},
+    };
+    const char* module = samples > 1 ? "tex_copy_conv_depth_snapshot_ms" : "tex_copy_conv_depth_snapshot";
+    if (fixed_draw(module, "vs_main", "fs_main", &target, out->tex->width, out->tex->height, true, binds, 1)) {
+        g_stats.conversions++;
+        gpu_mark(GpuWork::Conversion);
+    }
+}
+
+// ---- depth peek (see the top of the file)
+constexpr int kPeekMargin = 64;    // logical pixels around the peeked points (a camera turn of 1-2 frames)
+constexpr uint32_t kPeekSlots = 3;  // one being read, up to two in flight
+
+enum class PeekState : uint8_t { Free, InFlight, Done };
+struct PeekSlot {
+    swdk::Block mem;
+    PeekState state = PeekState::Free;
+    uint64_t frame = 0;                  // the deko3d frame whose commands fill it
+    uint32_t x = 0, y = 0, w = 0, h = 0;  // the copied area, in depth image pixels
+    depth_peek::SnapshotMapping map;     // logical EFB pixel -> depth image pixel
+};
+// Guards everything below: GXPeekZ's game thread reads, the render worker copies. Taken before
+// swdk::fence_mutex (frames_completed), never after it.
+std::mutex g_peekMutex;
+PeekSlot g_peek[kPeekSlots];
+int g_peekLatest = -1;  // the newest Done slot (the one read)
+int g_peekMinX = INT_MAX, g_peekMinY = INT_MAX, g_peekMaxX = INT_MIN, g_peekMaxY = INT_MIN;  // logical
+uint64_t g_peekCopies = 0;
+
+// Needs g_peekMutex: slots whose frame the GPU finished become Done, the newest of them the one read
+void peek_refresh_locked() {
+    const uint64_t completed = swdk::frames_completed();  // (any thread; one queue, in order)
+    for (uint32_t i = 0; i < kPeekSlots; i++) {
+        PeekSlot& p = g_peek[i];
+        if (p.state == PeekState::InFlight && p.frame <= completed) p.state = PeekState::Done;
+    }
+    int newest = g_peekLatest;
+    for (uint32_t i = 0; i < kPeekSlots; i++) {
+        if (g_peek[i].state == PeekState::Done && (newest < 0 || g_peek[i].frame > g_peek[newest].frame)) newest = int(i);
+    }
+    for (uint32_t i = 0; i < kPeekSlots; i++) {
+        if (int(i) != newest && g_peek[i].state == PeekState::Done) g_peek[i].state = PeekState::Free;
+    }
+    g_peekLatest = newest;
+}
+
+// encode_pass of the frame's last EFB pass (RenderPass::captureDepthSnapshot), after its barrier
+void depth_peek_capture(const RenderPass& pass) {
+    const auto& scene = pass.colorAttachments[SceneColorAttachmentIndex];
+    uint32_t sw = scene.size.width, sh = scene.size.height;
+    depth_peek::SnapshotMapping map;
+    if (!depth_peek::take_snapshot_request(sw, sh, map)) return;
+    View* v = pass.copySourceDepthView ? find_view(pass.copySourceDepthView.Get()) : nullptr;
+    Tex* t = v ? v->tex : nullptr;
+    if (!t || !t->valid || t->wformat != WGPUTextureFormat_Depth32Float || pass.msaaSamples > 1 || swdk::C.flipY) {
+        log_once("a depth peek of a depth buffer that is not single-sampled Depth32Float drawn upright");
+        return;
+    }
+    sw = std::min(sw, t->width);
+    sh = std::min(sh, t->height);
+    std::lock_guard<std::mutex> lock(g_peekMutex);
+    if (g_peekMinX > g_peekMaxX) return;  // (no point peeked since the last copy)
+    // the peeked area plus the margin, in depth image pixels (logical pixel x covers offset + [x, x + 1) * scale)
+    const auto lo = [](float off, float scale, int v, uint32_t size) {
+        return uint32_t(std::clamp(std::floor(off + float(v) * scale), 0.f, float(size - 1)));
+    };
+    const auto hi = [](float off, float scale, int v, uint32_t size) {
+        return uint32_t(std::clamp(std::ceil(off + float(v + 1) * scale), 1.f, float(size)));
+    };
+    const uint32_t x0 = lo(map.offsetX, map.scaleX, g_peekMinX - kPeekMargin, sw);
+    const uint32_t y0 = lo(map.offsetY, map.scaleY, g_peekMinY - kPeekMargin, sh);
+    const uint32_t x1 = hi(map.offsetX, map.scaleX, g_peekMaxX + kPeekMargin, sw);
+    const uint32_t y1 = hi(map.offsetY, map.scaleY, g_peekMaxY + kPeekMargin, sh);
+    g_peekMinX = g_peekMinY = INT_MAX;
+    g_peekMaxX = g_peekMaxY = INT_MIN;
+    if (x1 <= x0 || y1 <= y0) return;
+    peek_refresh_locked();
+    PeekSlot* slot = nullptr;
+    for (uint32_t i = 0; i < kPeekSlots && !slot; i++) {
+        if (g_peek[i].state == PeekState::Free) slot = &g_peek[i];
+    }
+    if (!slot) return;  // two copies still in flight: the next request
+    const uint32_t w = x1 - x0, h = y1 - y0, bytes = w * h * 4;
+    if (slot->mem.size < bytes) {
+        if (slot->mem) swdk::block_free_deferred(slot->mem.block);
+        slot->mem = swdk::block_create((bytes + 0xFFFFu) & ~0xFFFFu, "a depth peek copy");
+        if (!slot->mem) return;
+    }
+    transfer_begin();
+    const DkImageView src = level_view(t, 0);
+    const DkImageRect rect = {x0, y0, 0, w, h, 1};
+    const DkCopyBuf out = {slot->mem.gpu, w * 4, 0};
+    dkCmdBufCopyImageToBuffer(R.cmd, &src, &rect, &out, 0);
+    // the copy out of the GPU's L2 into memory before the CPU reads it (as read_texture)
+    barrier(DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_L2Cache);
+    g_stats.copies++;
+    gpu_mark(GpuWork::Copy);
+    slot->state = PeekState::InFlight;
+    slot->frame = R.frame + 1;
+    slot->x = x0;
+    slot->y = y0;
+    slot->w = w;
+    slot->h = h;
+    slot->map = map;
+    if (g_peekCopies++ == 0) {
+        dklog("depth peek: first copy, %ux%u of the %ux%u depth buffer at (%u, %u) for GXPeekZ", w, h, sw, sh, x0, y0);
+    }
+}
+
+// encoding.cpp render(): the EFB copy of a pass into its resolve target
+void efb_copy(const RenderPass& pass) {
+    const auto& dst = pass.resolveTarget;
+    const auto& scene = pass.colorAttachments[SceneColorAttachmentIndex];
+    const auto& rect = pass.resolveRect;
+    const bool needsConversion = tex_copy_conv::needs_conversion(pass.resolveFormat);
+    const bool needsScaling =
+        dst->size.width != static_cast<uint32_t>(rect.width) || dst->size.height != static_cast<uint32_t>(rect.height);
+    const bool isDepth = gx::is_depth_format(pass.resolveFormat);
+    const bool needsOpaqueAlpha = !isDepth && !gx::efb_has_alpha(pass.resolveSourceFormat);
+    const bool sameFormat = dst->format == scene.format;
+    const auto& srcView = isDepth ? pass.copySourceDepthView : pass.copySourceView;
+    {
+        // aleks2 (deko3d P3): each kind of EFB copy once: GX format, rectangle, pass target, destination, path
+        static std::vector<uint64_t> seen;
+        const uint64_t key = (uint64_t(pass.resolveFormat) << 48) ^ (uint64_t(rect.width) << 32) ^
+                             (uint64_t(rect.height) << 16) ^ (uint64_t(dst->format) << 4) ^
+                             (needsConversion ? 1u : 0u) ^ (needsScaling ? 2u : 0u) ^ (pass.label.empty() ? 0u : 8u);
+        if (seen.size() < 96 && std::find(seen.begin(), seen.end(), key) == seen.end()) {
+            seen.push_back(key);
+            dklog("EFB copy: GX format %d from %s (%ux%u target) rect %d,%d %dx%d into %ux%u format 0x%X: %s%s%s",
+                  int(pass.resolveFormat), pass.label.c_str(), scene.size.width, scene.size.height, rect.x, rect.y,
+                  rect.width, rect.height, dst->size.width, dst->size.height, unsigned(dst->format),
+                  needsConversion ? "conversion" : (needsScaling || needsOpaqueAlpha || !sameFormat) ? "blit" : "copy",
+                  needsScaling ? ", scaled" : "", find_view(srcView.Get()) ? "" : " [SOURCE VIEW UNKNOWN]");
+        }
+    }
+    if (needsConversion) {
+        convert_copy(pass.resolveFormat, false, srcView, pass.resolveUniformRange, dst, needsScaling);
+    } else if (needsScaling || needsOpaqueAlpha || !sameFormat) {
+        convert_copy(pass.resolveFormat, true, srcView, pass.resolveUniformRange, dst, needsScaling);
+    } else {
+        copy_image(find_texture(pass.copySourceTexture.Get()), 0, uint32_t(std::max(rect.x, 0)),
+                   uint32_t(std::max(rect.y, 0)), find_texture(dst->texture.Get()), 0, 0, 0, uint32_t(rect.width),
+                   uint32_t(rect.height));
+    }
+}
+
+// ---- passes
+void encode_pass(FramePacket& frame, RenderPass& pass) {
+    if (!pass.sealed) return;
+    for (const auto& conv : pass.paletteConvs) palette_conv(conv);
+    if (pass.discardable) return;
+    if (g_gpuTimers) g_openGroup = g_frameMarker != 0 ? g_frameMarker : intern_group(pass.label);
+    if (pass.msaaSamples > 1) log_once("a multisampled pass (drawn single-sampled)");
+    const auto& scene = pass.colorAttachments[SceneColorAttachmentIndex];
+    const uint32_t tw = scene.size.width, th = scene.size.height;
+    DkImageView colors[MaxColorAttachments];
+    const DkImageView* colorPtrs[MaxColorAttachments];
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < pass.colorAttachmentCount && i < MaxColorAttachments; i++) {
+        View* v = find_view(pass.colorAttachments[i].view.Get());
+        if (!v || !v->tex->valid) {
+            log_once("a pass whose colour target has no deko3d image (skipped)");
+            return;
+        }
+        colors[i] = target_view(v);
+        colorPtrs[i] = &colors[i];
+        count++;
+    }
+    DkImageView depth;
+    const DkImageView* depthPtr = nullptr;
+    g_passDepth = nullptr;
+    g_passColor = nullptr;
+    if (count > 0) {
+        if (View* cv = find_view(pass.colorAttachments[0].view.Get())) g_passColor = cv->tex;
+    }
+    if (pass.depthStencilView && (pass.hasDepth || pass.hasStencil)) {
+        View* v = find_view(pass.depthStencilView.Get());
+        if (v && v->tex->valid) {
+            depth = target_view(v);
+            depthPtr = &depth;
+            g_passDepth = v->tex;
+        }
+    }
+    dkCmdBufBindRenderTargets(R.cmd, colorPtrs, count, depthPtr);
+    // load ops (encoding.cpp render()): clears over the whole target
+    const DkScissor full = {0, 0, tw, th};
+    dkCmdBufSetScissors(R.cmd, 0, &full, 1);
+    g_cache.scValid = false;
+    for (uint32_t i = 0; i < count; i++) {
+        const auto& a = pass.colorAttachments[i];
+        const auto load = a.loadOp != wgpu::LoadOp::Undefined ? a.loadOp : (a.clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load);
+        if (load == wgpu::LoadOp::Clear) {
+            dkCmdBufClearColorFloat(R.cmd, i, DkColorMask_RGBA, a.clearValue.x(), a.clearValue.y(), a.clearValue.z(),
+                                    a.clearValue.w());
+        }
+    }
+    if (depthPtr) {
+        const auto depthLoad = pass.hasDepth ? (pass.depthLoadOp != wgpu::LoadOp::Undefined
+                                                    ? pass.depthLoadOp
+                                                    : (pass.clearDepth ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load))
+                                             : wgpu::LoadOp::Undefined;
+        const bool stencilClear = pass.hasStencil && pass.stencilLoadOp == wgpu::LoadOp::Clear;
+        if (depthLoad == wgpu::LoadOp::Clear || stencilClear) {
+            dkCmdBufClearDepthStencil(R.cmd, depthLoad == wgpu::LoadOp::Clear, pass.clearDepthValue,
+                                      stencilClear ? 0xFF : 0, uint8_t(pass.stencilClearValue));
+        }
+    }
+    g_frame.workSinceTransfer = true;
+    for (auto& c : pass.commands) {
+        switch (c.type) {
+        case CommandType::SetViewport: apply_viewport(c.data.setViewport); break;
+        case CommandType::SetScissor: apply_scissor(c.data.setScissor, tw, th); break;
+        case CommandType::Draw:
+            if (c.data.draw.encoder == nullptr) break;
+            switch (draw_kind(c.data.draw.encoder)) {
+            case DrawKind::Gx: draw_gx(c.data.draw); break;
+            case DrawKind::Clear: draw_clear(c.data.draw, tw, th); break;
+            case DrawKind::Rml:
+                if (draw_rml(c.data.draw.payload.data(), g_frame.staging, tw, th)) {
+                    g_stats.draws++;
+                    g_frame.workSinceTransfer = true;
+                    maybe_submit();
+                }
+                break;
+            case DrawKind::Other:
+                log_once("a draw command of another kind");
+                g_stats.skippedOther++;
+                break;
+            }
+            break;
+        case CommandType::CustomDraw:
+            log_once("a runtime-registered draw type (a mod's gfx service draw: not drawn with deko3d)");
+            g_stats.skippedOther++;
+            break;
+        case CommandType::DebugMarker:
+#ifdef AURORA_GFX_DEBUG_GROUPS
+            if (g_gpuTimers && c.data.debugMarkerIndex < frame.debugMarkers.size()) {
+                // the draws after it form a new group
+                const uint16_t g = intern_group(frame.debugMarkers[c.data.debugMarkerIndex]);
+                g_frameMarker = g;
+                if (g != g_openGroup) {
+                    gpu_mark(GpuWork::Efb);
+                    g_openGroup = g;
+                }
+            }
+#else
+            (void)frame;
+#endif
+            break;
+        }
+    }
+    // later passes and copies read what this one wrote
+    barrier(DkBarrier_Fragments, DkInvalidateFlags_Image);
+    gpu_mark(GpuWork::Efb);
+    g_stats.passes++;
+    if (pass.resolveTarget) efb_copy(pass);
+    if (pass.snapshotColorDst) {
+        copy_image(find_texture(pass.copySourceTexture.Get()), 0, 0, 0, find_texture(pass.snapshotColorDst.Get()), 0, 0,
+                   0, tw, th);
+    }
+    if (pass.snapshotDepthDst) depth_snapshot(pass.copySourceDepthView, pass.msaaSamples, pass.snapshotDepthDst);
+    if (pass.captureDepthSnapshot) depth_peek_capture(pass);
+    if (pass.snapshotNormalDst) {
+        copy_image(find_texture(pass.copySourceNormalTexture.Get()), 0, 0, 0, find_texture(pass.snapshotNormalDst.Get()),
+                   0, 0, 0, tw, th);
+    }
+}
+
+void texture_copy(const TextureCopy& c) {
+    copy_image(find_texture(c.src.texture.Get()), c.src.mipLevel, c.src.origin.x, c.src.origin.y,
+               find_texture(c.dst.texture.Get()), c.dst.mipLevel, c.dst.origin.x, c.dst.origin.y, c.size.width,
+               c.size.height);
+}
+
+}  // namespace
+
+void invalidate_state() { g_cache = Cache{}; }
+
+void gpu_mark(GpuWork work) {
+    if (!g_gpuTimers || !R.frameOpen) return;
+    const uint64_t frame = R.frame + 1;
+    Marks& m = g_marks[frame % swdk::kFrames];
+    if (m.count >= kMaxMarks) {
+        g_stats.gpuDropped++;
+        return;
+    }
+    const swdk::QueryRegion q = swdk::query_region(frame);
+    dkCmdBufReportCounter(R.cmd, DkCounter_Timestamp, q.gpu + uint64_t(m.count) * 16);
+    m.group[m.count] = work_group(work);
+    m.draws[m.count] = uint32_t(g_stats.draws - g_segDrawsStart);
+    g_segDrawsStart = g_stats.draws;
+    m.work[m.count++] = work;
+}
+
+EncodeStats& encode_stats() { return g_stats; }
+
+bool depth_peek_read(uint16_t x, uint16_t y, uint32_t& z) {
+    std::lock_guard<std::mutex> lock(g_peekMutex);
+    g_peekMinX = std::min(g_peekMinX, int(x));
+    g_peekMinY = std::min(g_peekMinY, int(y));
+    g_peekMaxX = std::max(g_peekMaxX, int(x));
+    g_peekMaxY = std::max(g_peekMaxY, int(y));
+    peek_refresh_locked();
+    if (g_peekLatest < 0) return false;
+    const PeekSlot& p = g_peek[g_peekLatest];
+    if (x >= p.map.logicalWidth || y >= p.map.logicalHeight) return false;
+    // depth_peek.cpp's shader: the depth image pixel under the logical pixel's centre
+    const int px = int(std::floor(p.map.offsetX + (float(x) + 0.5f) * p.map.scaleX));
+    const int py = int(std::floor(p.map.offsetY + (float(y) + 0.5f) * p.map.scaleY));
+    if (px < int(p.x) || py < int(p.y) || px >= int(p.x + p.w) || py >= int(p.y + p.h)) return false;
+    float depth;
+    memcpy(&depth, p.mem.cpu + (size_t(py - p.y) * p.w + size_t(px - p.x)) * 4, sizeof depth);
+    if (gx::UseReversedZ) depth = 1.f - depth;
+    z = std::min(uint32_t(std::clamp(depth, 0.f, 1.f) * 16777215.f + 0.5f), 0x00FFFFFFu);
+    return true;
+}
+
+bool fixed_draw(const char* module, const char* vsEntry, const char* fsEntry, const DkImageView* target, uint32_t w,
+                uint32_t h, bool clear, const FixedBind* binds, uint32_t bindCount, const DkBlendState* blend) {
+    const FixedShader sh = fixed_shader(module, vsEntry, fsEntry);
+    if (!sh) {
+        char what[160];
+        snprintf(what, sizeof what, "fixed shader %s (%s, %s) missing from the DKSH cache", module, vsEntry, fsEntry);
+        log_once(what);
+        return false;
+    }
+    if (target) {
+        const DkImageView* t[] = {target};
+        dkCmdBufBindRenderTargets(R.cmd, t, 1, nullptr);
+        set_swizzle(swdk::C.flipY);
+        swdk::set_view(0, 0, w, h);
+        if (clear) dkCmdBufClearColorFloat(R.cmd, 0, DkColorMask_RGBA, 0.f, 0.f, 0.f, 0.f);
+    }
+    const DkShader* shaders[] = {&sh.vs->shader, &sh.fs->shader};
+    dkCmdBufBindShaders(R.cmd, DkStageFlag_GraphicsMask, shaders, 2);
+    swdk::bind_2d_state(blend != nullptr);
+    if (blend) dkCmdBufBindBlendStates(R.cmd, 0, blend, 1);
+    for (const swdk::NamedShader* stage : {sh.vs, sh.fs}) {
+        const DkStage dkStage = stage == sh.vs ? DkStage_Vertex : DkStage_Fragment;
+        for (const swdk::SlotBinding& b : stage->bindings) {
+            for (uint32_t i = 0; i < bindCount; i++) {
+                if (binds[i].kind != b.kind || binds[i].binding != b.binding) continue;
+                if (b.kind == swdk::SlotBinding::Kind::Uniform) {
+                    dkCmdBufBindUniformBuffer(R.cmd, dkStage, b.slot, binds[i].addr, binds[i].size);
+                } else if (b.kind == swdk::SlotBinding::Kind::Sampler) {
+                    dkCmdBufBindTexture(R.cmd, dkStage, b.slot, binds[i].handle);
+                }
+            }
+        }
+    }
+    dkCmdBufBindVtxAttribState(R.cmd, nullptr, 0);
+    dkCmdBufBindVtxBufferState(R.cmd, nullptr, 0);
+    dkCmdBufDraw(R.cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
+    if (target) barrier(DkBarrier_Fragments, DkInvalidateFlags_Image);
+    invalidate_state();
+    g_frame.workSinceTransfer = true;
+    return true;
+}
+
+// aleks2 (V1): COS_DK_CACHED_UPLOAD=1 (perf-lab dk_cached_upload) makes the staging slots CPU-cached, cleaned up
+// to each op's high-water mark before the op's commands (clean_staging). Off by default: the console A/B tour decides.
+// Idea from ChanseyIsTheBest/renut_nx (c319b29, docs/deko3d-renderer.md and render-thread-proposals), used with his permission (2026-10-19).
+bool cached_upload() {
+    static const bool on = [] {
+        const bool v = swdk::env_flag("COS_DK_CACHED_UPLOAD", false);
+        dklog("encoder: staging slots %s (COS_DK_CACHED_UPLOAD)", v ? "CPU-cached, cleaned per op" : "CPU-uncached");
+        return v;
+    }();
+    return on;
+}
+
+void clean_staging(FramePacket& frame, const FrameOp& op) {
+    if (!cached_upload()) return;
+    const DkMemBlock block = g_staging[frame.stagingBuffer].block.block;
+    const uint64_t base[5] = {kVertexOffset, kUniformOffset, kIndexOffset, kStorageOffset, kTextureUploadOffset};
+    const uint32_t high[5] = {op.highWater.verts, op.highWater.uniforms, op.highWater.indices, op.highWater.storage,
+                              op.highWater.textureUpload};
+    for (int i = 0; i < 5; i++) {
+        if (high[i] <= g_frame.cleaned[i]) continue;
+        const uint64_t from = base[i] + (g_frame.cleaned[i] & ~63u);
+        const uint64_t to = base[i] + ((uint64_t(high[i]) + 63) & ~uint64_t(63));
+        dkMemBlockFlushCpuCache(block, uint32_t(from), uint32_t(to - from));
+        g_frame.cleaned[i] = high[i];
+    }
+}
+
+StagingMemory staging_create(size_t slot, uint64_t size) {
+    char what[64];
+    snprintf(what, sizeof what, "Aurora staging slot %zu (vertices, uniforms, indices, storage, uploads)", slot);
+    g_staging[slot].block = cached_upload() ? swdk::block_create_cached(uint32_t(size), what)
+                                            : swdk::block_create(uint32_t(size), what);
+    return {g_staging[slot].block.cpu, g_staging[slot].block.gpu};
+}
+
+bool staging_ready(size_t slot) {
+    const uint64_t frame = g_staging[slot].frame.load(std::memory_order_acquire);
+    return frame == 0 || swdk::frames_completed() >= frame;
+}
+
+void frame_presented(size_t stagingSlot) {
+    g_staging[stagingSlot].frame.store(R.frame, std::memory_order_release);
+    g_frame.open = false;
+}
+
+void frame_begin(FramePacket& frame) {
+    static const bool once = [] {
+        g_submitDraws = uint32_t(std::max(0L, swdk::env_long("COS_DK_SUBMIT_DRAWS", 256)));
+        g_gpuTimersAllowed = swdk::env_flag("COS_DK_GPU_TIMERS", true);
+        dklog("encoder: Aurora's frames recorded into deko3d; submits every %u draws (COS_DK_SUBMIT_DRAWS), a "
+              "barrier at every pass end, GPU timestamps %s (COS_DK_GPU_TIMERS)",
+              g_submitDraws, g_gpuTimersAllowed ? "while requested" : "off");
+        return true;
+    }();
+    (void)once;
+    g_gpuTimers = g_gpuTimersAllowed && aurora::webgpu::gpu_timing::requested();
+    {
+        // aleks2 (deko3d P3): every 900 frames, what the encoder did and skipped since the last line
+        static uint64_t frames = 0;
+        static EncodeStats last{};
+        if (++frames % 900 == 0) {
+            const EncodeStats& s = g_stats;
+            dklog("encoder (900 frames): %llu passes, %llu draws, %llu clears, %llu copies, %llu conversions, %llu "
+                  "uploads; skipped draws: %llu without a pipeline, %llu waiting for shaders, %llu other",
+                  (unsigned long long)(s.passes - last.passes), (unsigned long long)(s.draws - last.draws),
+                  (unsigned long long)(s.clears - last.clears), (unsigned long long)(s.copies - last.copies),
+                  (unsigned long long)(s.conversions - last.conversions), (unsigned long long)(s.uploads - last.uploads),
+                  (unsigned long long)(s.skippedPipeline - last.skippedPipeline),
+                  (unsigned long long)(s.skippedShader - last.skippedShader),
+                  (unsigned long long)(s.skippedOther - last.skippedOther));
+            last = s;
+        }
+    }
+    swdk::frame_open();
+    objects_frame_start();
+    const uint64_t f = R.frame + 1;
+    if (f > swdk::kFrames) read_marks(f - swdk::kFrames);  // that frame's fence was waited for in frame_open
+    g_marks[f % swdk::kFrames].count = 0;
+    g_marks[f % swdk::kFrames].cpuNs = swdk::now_ns();
+    g_frameMarker = 0;
+    g_openGroup = 0;
+    g_segDrawsStart = g_stats.draws;
+    g_frame = FrameState{};
+    g_frame.open = true;
+    // the previous frame's draws may still sample what this frame's first upload overwrites: the copy
+    // engine waits for them (the queue orders submissions, not engines)
+    g_frame.workSinceTransfer = true;
+    g_frame.staging = g_staging[frame.stagingBuffer].block.gpu;
+    const swdk::StreamAlloc imm = swdk::stream_alloc(kImmediatesSize, DK_UNIFORM_BUF_ALIGNMENT);
+    g_frame.immediates = imm.gpu;
+    if (imm) memset(imm.cpu, 0, kImmediatesSize);
+    invalidate_state();
+    gpu_mark(GpuWork::FrameStart);
+}
+
+void encode_op(FramePacket& frame, const FrameOp& op) {
+    swdk::host_alloc_thread();
+    if (!g_frame.open || !R.frameOpen) frame_begin(frame);
+    const uint64_t t0 = swdk::now_ns();
+    clean_staging(frame, op);  // aleks2 (V1, COS_DK_CACHED_UPLOAD): before anything below reads the slot
+    do_uploads(op);
+    switch (op.type) {
+    case FrameOpType::RenderPass:
+        if (op.renderPass) encode_pass(frame, *op.renderPass);
+        break;
+    case FrameOpType::TextureCopy:
+        if (op.textureCopy) texture_copy(*op.textureCopy);
+        break;
+    case FrameOpType::EncoderTask:
+        if (op.encoderTask) log_once("an encoder task (a mod's gfx service task: not run with deko3d)");
+        break;
+    }
+    g_stats.encodeNs += swdk::now_ns() - t0;
+}
+
+OverflowUpload overflow_upload(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage) {
+    const uint32_t rowBytes = (bytesPerRow + 255u) & ~255u;
+    swdk::Block b = swdk::block_create(rowBytes * rowsPerImage, "an oversized texture upload");
+    for (uint32_t r = 0; r < rowsPerImage; r++) memcpy(b.cpu + size_t(r) * rowBytes, data + size_t(r) * bytesPerRow, bytesPerRow);
+    return {b.block, b.gpu};
+}
+
+}  // namespace aurora::gfx::dk
+
+extern "C" size_t aurora_switch_dk_gpu_groups(AuroraSwitchGpuGroup* out, size_t max) {
+    using namespace aurora::gfx::dk;
+    std::lock_guard<std::mutex> lock(g_groupMutex);
+    const size_t n = std::min(max, g_groups.size());
+    for (size_t i = 0; i < n; i++) out[i] = g_groups[i];
+    return n;
+}

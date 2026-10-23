@@ -1,4 +1,5 @@
 #include "texture.hpp"
+#include <aurora/tuning.h>
 
 #include "../gfx/recording.hpp"
 #include "../gfx/tex_palette_conv.hpp"
@@ -12,12 +13,14 @@
 #include <xxhash.h>
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <cstring>
 #include <list>
+#include <map>
 #include <optional>
 #include <utility>
 
@@ -814,8 +817,89 @@ void evict_tlut_object(u32 tlutObjId) noexcept {
   texture::invalidate_bindings();
 }
 
+// aleks2 (V1-rc12): copy-binding counters (aurora_gx_copy_bind_stats, tuning.h).
+namespace {
+struct CopyRange {
+  uintptr_t end;
+  u16 width, height;
+  u32 scaledWidth, scaledHeight;  // the copy texture's size (scale_copy_dst)
+};
+std::mutex s_copyRangeMutex;
+std::map<uintptr_t, CopyRange> s_copyRanges;  // start -> range of the last copy made there
+std::atomic<uint64_t> s_bindInsideCopy{0};    // texture inside a copy's range, not at its start
+std::atomic<uint64_t> s_bindSizeMismatch{0};  // texture at a copy's start, with another size than the copy
+} // namespace
+
+void note_copy_range(const void* dest, u16 width, u16 height, u32 format, u32 scaledWidth,
+                     u32 scaledHeight) noexcept {
+  const auto start = reinterpret_cast<uintptr_t>(dest);
+  const u32 bytes = GXGetTexBufferSize(width, height, format, false, 0);
+  std::lock_guard lock{s_copyRangeMutex};
+  s_copyRanges[start] = CopyRange{start + bytes, width, height, scaledWidth, scaledHeight};
+  if (s_copyRanges.size() > 4096) {
+    s_copyRanges.clear();  // a bound: only the recent copies matter
+  }
+}
+
+static void count_copy_bind(const GXTexObj_& obj, bool exactCopy) noexcept {
+  const auto addr = reinterpret_cast<uintptr_t>(obj.data);
+  if (addr == 0) {
+    return;
+  }
+  std::lock_guard lock{s_copyRangeMutex};
+  if (exactCopy) {
+    if (const auto it = s_copyRanges.find(addr);
+        it != s_copyRanges.end() && (it->second.width != obj.width() || it->second.height != obj.height())) {
+      s_bindSizeMismatch.fetch_add(1, std::memory_order_relaxed);
+    }
+    return;
+  }
+  auto it = s_copyRanges.upper_bound(addr);
+  if (it == s_copyRanges.begin()) {
+    return;
+  }
+  --it;
+  if (addr > it->first && addr < it->second.end) {
+    s_bindInsideCopy.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+// aleks2 (V1-rc12): AURORA_DEBUG_COPY_SHAPE_MATCH -- a texture at a copy's address whose size is not the latest copy's
+// gets the cached copy at that address with its own size (copyTextureCache keeps one per destination, size and format),
+// instead of the latest copy at another size. Same size: unchanged. Null when there is none.
+static gfx::TextureHandle shape_matched_copy(const GXTexObj_& obj) noexcept {
+  if ((aurora_debug_flags() & AURORA_DEBUG_COPY_SHAPE_MATCH) == 0) {
+    return {};
+  }
+  CopyRange latest{};
+  {
+    std::lock_guard lock{s_copyRangeMutex};
+    const auto it = s_copyRanges.find(reinterpret_cast<uintptr_t>(obj.data));
+    if (it == s_copyRanges.end()) {
+      return {};
+    }
+    latest = it->second;
+  }
+  if ((latest.width == obj.width() && latest.height == obj.height()) || latest.width == 0 || latest.height == 0) {
+    return {};
+  }
+  const u32 wantW = static_cast<u32>(std::lround(static_cast<double>(obj.width()) * latest.scaledWidth / latest.width));
+  const u32 wantH =
+      static_cast<u32>(std::lround(static_cast<double>(obj.height()) * latest.scaledHeight / latest.height));
+  for (const auto& [key, ref] : g_gxState.copyTextureCache) {
+    if (key.dest == obj.data && key.width == wantW && key.height == wantH && ref.handle) {
+      return ref.handle;
+    }
+  }
+  return {};
+}
+
+// aleks2 (V1-rc11): see aurora_gx_copy_cache_generation (tuning.h).
+static std::atomic<uint32_t> s_copyCacheGeneration{0};
+
 void clear_copy_texture_cache() noexcept {
   std::lock_guard lock{s_textureCacheMutex};
+  s_copyCacheGeneration.fetch_add(1, std::memory_order_relaxed);
   g_gxState.copyTextures.clear();
   g_gxState.copyTextureCache.clear();
   for (auto& [_, cache] : s_tlutObjectCaches) {
@@ -896,12 +980,30 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
       }
     } else if (copyRef != nullptr) {
       handle = copyRef->handle;
+      if (auto matched = shape_matched_copy(obj)) {  // V1-rc12, off unless AURORA_DEBUG_COPY_SHAPE_MATCH
+        handle = std::move(matched);
+      }
     } else if (obj.has_data()) {
       handle = texture::resolve_static_texture(obj);
     }
+    count_copy_bind(obj, copyRef != nullptr);
 
     obj.mFormat = resolved_format_for_handle(handle);
     textureBind = gfx::TextureBind{obj, std::move(handle), s_bindGeneration};
   }
 }
 } // namespace aurora::gx
+
+extern "C" uint32_t aurora_gx_copy_cache_generation(void) {
+  return aurora::gx::s_copyCacheGeneration.load(std::memory_order_relaxed);
+}
+
+extern "C" void aurora_gx_copy_bind_stats(uint64_t* insideCopy, uint64_t* sizeMismatch) {
+  if (insideCopy != nullptr) {
+    *insideCopy = aurora::gx::s_bindInsideCopy.load(std::memory_order_relaxed);
+  }
+  if (sizeMismatch != nullptr) {
+    *sizeMismatch = aurora::gx::s_bindSizeMismatch.load(std::memory_order_relaxed);
+  }
+}
+

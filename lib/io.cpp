@@ -223,13 +223,24 @@ bool AtomicFileWriter::commit() noexcept {
     return false;
   }
 
-  SDL_RemovePath(m_targetPath.c_str());
+  // aleks2 (V1-rc5): the old file is moved aside, not removed, before the new one takes its name: removing it
+  // first left a moment with no save at all (a crash or power loss there lost it). Rename does not replace an
+  // existing file on every platform (the Switch's), hence the two steps.
+  const std::string previousPath = m_targetPath + ".old";
+  SDL_RemovePath(previousPath.c_str());
+  const bool movedAside = SDL_RenamePath(m_targetPath.c_str(), previousPath.c_str());
   SDL_ClearError();
   if (!SDL_RenamePath(m_temporaryPath.c_str(), m_targetPath.c_str())) {
     const std::string error{SDL_GetError()};
+    if (movedAside) {
+      SDL_RenamePath(previousPath.c_str(), m_targetPath.c_str());
+    }
     discard();
     restore_error(error);
     return false;
+  }
+  if (movedAside) {
+    SDL_RemovePath(previousPath.c_str());
   }
 
   m_temporaryPath.clear();

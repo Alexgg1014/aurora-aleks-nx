@@ -1,5 +1,7 @@
 #include <aurora/aurora.h>
 #include <aurora/time.hpp>
+#include <algorithm>
+#include <array>
 
 #ifdef AURORA_ENABLE_GX
 #include "aux_window.hpp"
@@ -17,11 +19,17 @@
 #include "imgui.hpp"
 #include "webgpu/gpu.hpp"
 #include "webgpu/gpu_prof.hpp"
+#include "webgpu/gpu_timing.hpp"
 #include <webgpu/webgpu_cpp.h>
 #endif
 
 #ifdef AURORA_ENABLE_RMLUI
 #include "rmlui.hpp"
+#if defined(AURORA_GFX_DEKO3D)
+// aleks2 (deko3d P1): the run-time selectable deko3d renderer (lib/deko)
+#include "dk_gfx.hpp"
+#include "dk_runtime.hpp"
+#endif
 #endif
 
 #include "input.hpp"
@@ -166,7 +174,13 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   AURORA_ASSERT(windowCreated, "Error creating window: {}", SDL_GetError());
 
   // Initialize SDL_Renderer for ImGui when we can't use a Dawn backend
-  if (webgpu::g_backendType == wgpu::BackendType::Null) {
+  bool sdlRenderer = webgpu::g_backendType == wgpu::BackendType::Null;
+#if defined(AURORA_GFX_DEKO3D)
+  // aleks2 (deko3d P2): Dawn's Null device on purpose (the object model); lib/deko draws ImGui and owns
+  // the window. The Switch's SDL has no render driver: P1 aborted here (after SwitchWaker patch 0013).
+  sdlRenderer = sdlRenderer && !gfx::dk::active();
+#endif
+  if (sdlRenderer) {
     AURORA_ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
   }
 #else
@@ -248,7 +262,11 @@ bool begin_frame() noexcept {
     if (window::is_paused()) {
       return false;
     }
-    if (!g_surface) {
+    bool needsSurface = true;
+#if defined(AURORA_GFX_DEKO3D)
+    needsSurface = !gfx::dk::active();  // (lib/deko presents to the default window)
+#endif
+    if (needsSurface && !g_surface) {
       webgpu::refresh_surface(true);
       if (!g_surface) {
         return false;
@@ -289,9 +307,33 @@ void end_frame() noexcept {
   }
 #endif
 
-  gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport,
+  // aleks2 (V1): the input -> present probe: this frame's first controller read
+  const int64_t latencyInputNs = gfx::latency_take_input();
+  gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport, latencyInputNs,
                   imguiDrawData = std::move(imguiDrawData)](
                      wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> afterSubmitCallbacks) {
+#if defined(AURORA_GFX_DEKO3D)
+    if (gfx::dk::active()) {
+      // aleks2 (deko3d P1): the frame was recorded into deko3d as its passes were sealed (lib/deko);
+      // lib/deko presents: the EFB (or RmlUi's composite of it) resampled and fitted, RmlUi's overlay,
+      // ImGui, the submit and the present. Single screen, normal layout (no aux window, no Flip Grip).
+      (void)encoder;
+      (void)viewport;
+      gfx::dk::set_present_layers(rmlBindGroup.Get(), rmlOverlay);
+      imgui::present_deko3d(imguiDrawData);
+      gfx::dk::set_present_layers(nullptr, false);
+      gfx::after_present();
+      gfx::latency_note_presented(latencyInputNs);  // aleks2 (V1): input -> present probe
+      gfx::dk::boot_presented();
+      for (auto& callback : afterSubmitCallbacks) {
+        if (callback) {
+          callback();
+        }
+      }
+      gfx::after_submit();
+      return;
+    }
+#endif
     wgpu::Texture currentTexture;
     wgpu::TextureView currentView;
     auto surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::Error;
@@ -422,6 +464,7 @@ void end_frame() noexcept {
     // whenever no aux surface existed, and every single-screen device drew
     // nothing while running perfectly.
     webgpu::gpu_prof::frame_end(encoder);
+    webgpu::gpu_timing::frame_end(encoder);
     const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
     const auto buffer = encoder.Finish(&cmdBufDescriptor);
     {
@@ -429,6 +472,7 @@ void end_frame() noexcept {
       g_queue.Submit(1, &buffer);
     }
     webgpu::gpu_prof::after_submit();
+    webgpu::gpu_timing::after_submit();
     auxwin::present(currentView);
     if (canPresent && g_surface) {
       ZoneScopedN("Present");
@@ -441,6 +485,7 @@ void end_frame() noexcept {
       }
       if (status) {
         gfx::after_present();
+      gfx::latency_note_presented(latencyInputNs);  // aleks2 (V1): input -> present probe
       } else {
         Log.warn("Surface present failed");
         webgpu::release_surface();
@@ -512,10 +557,33 @@ bool aurora_begin_frame() { return aurora::begin_frame(); }
 void aurora_end_frame() { aurora::end_frame(); }
 AuroraBackend aurora_get_backend() { return aurora::g_config.desiredBackend; }
 const AuroraBackend* aurora_get_available_backends(size_t* count) {
+#if defined(AURORA_GFX_DEKO3D)
+  // aleks2 (deko3d P1): deko3d is offered (Settings, "Experimental") but is never in the fallback order
+  static const auto withDeko3d = [] {
+    std::array<AuroraBackend, aurora::PreferredBackendOrder.size() + 1> list{};
+    std::copy(aurora::PreferredBackendOrder.begin(), aurora::PreferredBackendOrder.end(), list.begin());
+    list.back() = BACKEND_DEKO3D;
+    return list;
+  }();
+  if (count != nullptr) {
+    *count = withDeko3d.size();
+  }
+  return withDeko3d.data();
+#else
   if (count != nullptr) {
     *count = aurora::PreferredBackendOrder.size();
   }
   return aurora::PreferredBackendOrder.data();
+#endif
+}
+// aleks2 (deko3d P1): true when deko3d was asked for but this start fell back to Dawn/NVK (two starts in
+// a row that never presented a frame); the game resets its setting and tells the player
+bool aurora_deko3d_fell_back() {
+#if defined(AURORA_GFX_DEKO3D)
+  return aurora::gfx::dk::fell_back();
+#else
+  return false;
+#endif
 }
 void aurora_set_log_level(AuroraLogLevel level) { aurora::g_config.logLevel = level; }
 void aurora_set_pause_on_focus_lost(bool value) { aurora::g_config.pauseOnFocusLost = value; }
