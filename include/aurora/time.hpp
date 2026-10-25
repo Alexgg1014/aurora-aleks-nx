@@ -38,4 +38,10 @@ void set_scale(float scale) noexcept;
 
 float scale() noexcept;
 
+/** aleks2 (Switch 1.0.1): leaves out of game_clock a span the app spent suspended (the console asleep), which the
+ *  platform only learns about after it ends. The span is measured back from now and never reaches before the clock's
+ *  last rebase, and the clock never goes below a time it already handed out. Returns how much game time was actually
+ *  left out. Wall-clock time (OSGetSystemTime, wall_clock) is not affected. */
+std::chrono::nanoseconds skip_suspended(std::chrono::nanoseconds span) noexcept;
+
 } // namespace aurora::time

@@ -24,6 +24,8 @@ struct ClockState {
   game_clock::time_point gameAnchor;
   double requestedScale = 1.0;
   uint32_t pauseReasons = 0;
+  // aleks2 (1.0.1): the latest game time handed out, so skip_suspended never moves the clock backwards.
+  std::atomic<game_clock::rep> lastReturned{0};
 };
 
 ClockState& state() {
@@ -56,7 +58,12 @@ native_clock::time_point native_clock::now() noexcept { return get_native_now();
 game_clock::time_point game_clock::now() noexcept {
   auto& clockState = state();
   std::shared_lock lock{clockState.mutex};
-  return game_now_locked(clockState, get_native_now());
+  const auto now = game_now_locked(clockState, get_native_now());
+  const auto ticks = now.time_since_epoch().count();
+  auto seen = clockState.lastReturned.load(std::memory_order_relaxed);
+  while (ticks > seen && !clockState.lastReturned.compare_exchange_weak(seen, ticks, std::memory_order_relaxed)) {
+  }
+  return now;
 }
 
 void set_scale(const float scale) noexcept {
@@ -79,6 +86,30 @@ float scale() noexcept {
   auto& clockState = state();
   std::shared_lock lock{clockState.mutex};
   return static_cast<float>(clockState.requestedScale);
+}
+
+std::chrono::nanoseconds skip_suspended(const std::chrono::nanoseconds span) noexcept {
+  if (span.count() <= 0) {
+    return {};
+  }
+  auto& clockState = state();
+  std::unique_lock lock{clockState.mutex};
+  const auto nativeNow = get_native_now();
+  // Freeze the game clock where the suspension began (never before the last rebase), then resume counting from now.
+  auto suspendedAt = nativeNow - std::chrono::duration_cast<native_clock::duration>(span);
+  if (suspendedAt < clockState.nativeAnchor) {
+    suspendedAt = clockState.nativeAnchor;
+  }
+  auto anchor = game_now_locked(clockState, suspendedAt);
+  // Never below a time already handed out (something may have read the clock between the wake-up and this call).
+  const game_clock::time_point handedOut{game_clock::duration{clockState.lastReturned.load(std::memory_order_relaxed)}};
+  if (anchor < handedOut) {
+    anchor = handedOut;
+  }
+  const auto before = game_now_locked(clockState, nativeNow);
+  clockState.gameAnchor = anchor;
+  clockState.nativeAnchor = nativeNow;
+  return before > anchor ? std::chrono::duration_cast<std::chrono::nanoseconds>(before - anchor) : std::chrono::nanoseconds{};
 }
 
 namespace internal {
@@ -110,6 +141,7 @@ void reset() noexcept {
   std::unique_lock lock{clockState.mutex};
   clockState.nativeAnchor = get_native_now();
   clockState.gameAnchor = {};
+  clockState.lastReturned.store(0, std::memory_order_relaxed);
   clockState.requestedScale = 1.0;
   clockState.pauseReasons = 0;
 }
