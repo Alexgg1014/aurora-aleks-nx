@@ -36,7 +36,6 @@ namespace {
 
 std::mutex g_statsMutex;
 PipelineStats g_stats;
-std::mutex g_translateMutex;  // Tint, called from one thread anyway
 
 DkCompareOp compare_op(wgpu::CompareFunction f) {
     switch (f) {
@@ -215,7 +214,7 @@ const void* build_gx_pipeline(const gx::PipelineConfig& config, const RenderTarg
         }
         swdk::TranslateResult tv, tf;
         {
-            std::lock_guard<std::mutex> lock(g_translateMutex);
+            std::lock_guard<std::mutex> lock(translate_mutex());
             tv = swdk::wgsl_to_glsl(wgsl, "vs_main", ShaderStage::Vertex, swdk::BindingScheme::GX);
             tf = swdk::wgsl_to_glsl(wgsl, "fs_main", ShaderStage::Fragment, swdk::BindingScheme::GX);
         }
@@ -315,6 +314,11 @@ const void* build_clear_pipeline(const clear::PipelineConfig& config, const Rend
     std::lock_guard<std::mutex> lock(g_statsMutex);
     g_stats.clear++;
     return p;
+}
+
+std::mutex& translate_mutex() {
+    static std::mutex m;  // Tint
+    return m;
 }
 
 PipelineStats pipeline_stats() {

@@ -74,6 +74,9 @@ typedef struct {
   uint32_t processing_mode; /* 0 = at drain, 1 = inline at publish, 2 = worker thread */
 } AuroraFifoStats;
 void aurora_gx_fifo_stats(AuroraFifoStats* out);
+/* aleks2 (v1.1-perf-lab): the FIFO worker thread's kernel handle on the Switch (for the game's sampling profiler);
+ * 0 before the worker starts, without a worker thread, or on other platforms. */
+uint32_t aurora_gx_fifo_thread_handle(void);
 
 /* H35 diagnostic: reuse of the uniform block when only the pipeline changed.
  * OFF    = the H34 path exactly: every dirty uniform is filled, hashed and pushed.
@@ -218,6 +221,9 @@ typedef enum {
   AURORA_FIFO_FAST_ALL = 0x1Fu,
 } AuroraFifoFastPath;
 void aurora_gx_set_fifo_fast(uint32_t mask);
+/* aleks2 (v1.1-perf-lab-3): fifo_quiet -- the FIFO worker and a draining game thread are woken only when they sleep
+ * (libstdc++'s atomic notify is a mutex and a kernel broadcast on newlib, waiter or not). Can change at any time. */
+void aurora_gx_set_fifo_quiet(bool on);
 /* aleks2 (V1-rc8): texture-replacement cache budget in MB (0 = platform default: 640 on Switch, 4096 elsewhere). */
 void aurora_gx_set_texrep_budget_mb(uint32_t mb);
 uint32_t aurora_gx_get_texrep_budget_mb(void);

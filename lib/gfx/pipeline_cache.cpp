@@ -1970,6 +1970,11 @@ uint32_t aurora_pipeline_live_count(void) {
   return static_cast<uint32_t>(aurora::gfx::g_pipelines.size());
 }
 
+uint32_t aurora_shader_warmup_pending(void) {
+  std::lock_guard lock{aurora::gfx::g_pipelineMutex};
+  return static_cast<uint32_t>(aurora::gfx::g_warmupPending.size());
+}
+
 uint32_t aurora_shader_warmup_released(void) {
   std::lock_guard lock{aurora::gfx::g_pipelineMutex};
   return aurora::gfx::g_warmupReleased;

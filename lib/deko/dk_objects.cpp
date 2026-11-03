@@ -92,9 +92,10 @@ void destroy(Tex* t) {
 }
 void release_tex(Tex* t);
 void destroy(View* v) {
-    if (v->slot) {
+    if (v->slot || v->storageSlot) {
         std::lock_guard<std::mutex> lock(g_slotMutex);
-        g_freedSlots.push_back(v->slot);
+        if (v->slot) g_freedSlots.push_back(v->slot);
+        if (v->storageSlot) g_freedSlots.push_back(v->storageSlot);  // v1.1
     }
     Tex* t = v->tex;
     delete v;
@@ -193,6 +194,8 @@ Tex* make_texture(WGPUTexture handle, const WGPUTextureDescriptor& d) {
     const bool render = (d.usage & WGPUTextureUsage_RenderAttachment) != 0;
     if (render && f.canRender) m.flags |= DkImageFlags_UsageRender;
     if (f.can2d) m.flags |= DkImageFlags_Usage2DEngine;
+    // v1.1: a mod's storage texture (dk_modgfx.cpp binds it as an image)
+    if ((d.usage & WGPUTextureUsage_StorageBinding) != 0) m.flags |= DkImageFlags_UsageLoadStore;
     if (render && g_compression && !f.depth) m.flags |= DkImageFlags_HwCompression;
     swdk::image_tile_size_fix(m, f.compressed ? (t->height + f.blockH - 1) / f.blockH : t->height);
     DkImageLayout layout;

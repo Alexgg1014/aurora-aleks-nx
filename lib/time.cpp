@@ -23,6 +23,9 @@ struct ClockState {
   native_clock::time_point nativeAnchor = default_native_now();
   game_clock::time_point gameAnchor;
   double requestedScale = 1.0;
+  // aleks2 (v1.1-perf-lab): requestedScale for scale(), which the game reads many times a frame; the shared lock it
+  // took showed up in the stack profile (rwlock unlock wakes, ~0.8 % of the game thread). Written under the lock.
+  std::atomic<float> scaleSnapshot{1.0f};
   uint32_t pauseReasons = 0;
   // aleks2 (1.0.1): the latest game time handed out, so skip_suspended never moves the clock backwards.
   std::atomic<game_clock::rep> lastReturned{0};
@@ -80,13 +83,10 @@ void set_scale(const float scale) noexcept {
   const auto nativeNow = get_native_now();
   rebase_locked(clockState, nativeNow);
   clockState.requestedScale = clampedScale;
+  clockState.scaleSnapshot.store(static_cast<float>(clampedScale), std::memory_order_relaxed);
 }
 
-float scale() noexcept {
-  auto& clockState = state();
-  std::shared_lock lock{clockState.mutex};
-  return static_cast<float>(clockState.requestedScale);
-}
+float scale() noexcept { return state().scaleSnapshot.load(std::memory_order_relaxed); }
 
 std::chrono::nanoseconds skip_suspended(const std::chrono::nanoseconds span) noexcept {
   if (span.count() <= 0) {
@@ -143,6 +143,7 @@ void reset() noexcept {
   clockState.gameAnchor = {};
   clockState.lastReturned.store(0, std::memory_order_relaxed);
   clockState.requestedScale = 1.0;
+  clockState.scaleSnapshot.store(1.0f, std::memory_order_relaxed);
   clockState.pauseReasons = 0;
 }
 

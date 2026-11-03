@@ -6,6 +6,7 @@
 #include <deko3d.h>
 
 #include <cstdint>
+#include <mutex>
 
 #include "dk.h"
 
@@ -44,5 +45,7 @@ struct PipelineStats {
     uint64_t translateNs = 0, waitNs = 0;
 };
 PipelineStats pipeline_stats();
+// v1.1: held around every Tint call (the compile thread's, and dk_modgfx.cpp's for mods' shaders)
+std::mutex& translate_mutex();
 
 }  // namespace aurora::gfx::dk

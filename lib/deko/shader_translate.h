@@ -33,7 +33,8 @@
 namespace swdk {
 
 // uam::Stage's numbering (uam_api.h), stored in the DKSH cache records.
-enum class ShaderStage : uint8_t { Vertex = 0, Fragment = 4 };
+// v1.1 (mods' gfx service on deko3d, dk_modgfx.cpp): Compute.
+enum class ShaderStage : uint8_t { Vertex = 0, Fragment = 4, Compute = 5 };
 
 // How WGSL bindings map to deko3d slots.
 enum class BindingScheme : uint8_t {
@@ -55,11 +56,19 @@ constexpr uint32_t kImmediatesUboSlot = 15;
 constexpr uint32_t kTranslateRevision = 1;
 
 struct SlotBinding {
-    enum class Kind : uint8_t { Uniform, Storage, Sampler, Immediates };
+    // v1.1: Image, a storage texture (Sequential only; its own numbering, dkCmdBufBindImage)
+    enum class Kind : uint8_t { Uniform, Storage, Sampler, Immediates, Image };
     Kind kind = Kind::Uniform;
     uint8_t slot = 0;
     // WGSL binding point (for a combined sampler: the texture's); Immediates: 0, 0
     uint32_t group = 0;
+    uint32_t binding = 0;
+};
+
+// v1.1: the sampler of each combined sampler, in the order of the Sampler entries of bindings (not
+// part of the DKSH cache's records). group UINT32_MAX: textureLoad without a sampler.
+struct SamplerSource {
+    uint32_t group = UINT32_MAX;
     uint32_t binding = 0;
 };
 
@@ -68,6 +77,7 @@ struct TranslateResult {
     std::string glsl;   // after the post-pass
     std::string error;  // Tint's or the post-pass's reason when !ok
     std::vector<SlotBinding> bindings;
+    std::vector<SamplerSource> samplers;  // v1.1
     uint32_t immediateSize = 0;  // bytes the entry point uses of the immediates, 0 if none
 };
 
@@ -77,6 +87,10 @@ void translate_init();
 // One entry point of a WGSL module. Never throws; failures come back in error.
 TranslateResult wgsl_to_glsl(const std::string& wgsl, const std::string& entryPoint, ShaderStage stage,
                              BindingScheme scheme);
+
+// v1.1: the name of the module's only entry point of a stage (a pipeline descriptor may leave it
+// out), or empty with the reason in *error.
+std::string entry_point_of(const std::string& wgsl, ShaderStage stage, std::string* error);
 
 // The post-pass alone (exposed for tests): rewrites Tint's GLSL as described above. samplerSlots maps
 // the combined sampler names Tint emitted to their slots. Returns false (why in *error) when a sampler

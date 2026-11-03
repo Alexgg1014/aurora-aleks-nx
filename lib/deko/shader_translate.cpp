@@ -37,6 +37,19 @@ bool is_texture(RB::ResourceType t) {
     return t == RB::ResourceType::kSampledTexture || t == RB::ResourceType::kDepthTexture ||
            t == RB::ResourceType::kMultisampledTexture || t == RB::ResourceType::kDepthMultisampledTexture;
 }
+// v1.1: storage textures (mods' compute shaders), deko3d images
+bool is_storage_texture(RB::ResourceType t) {
+    return t == RB::ResourceType::kWriteOnlyStorageTexture || t == RB::ResourceType::kReadOnlyStorageTexture ||
+           t == RB::ResourceType::kReadWriteStorageTexture;
+}
+
+tint::inspector::PipelineStage tint_stage(ShaderStage s) {
+    switch (s) {
+    case ShaderStage::Vertex: return tint::inspector::PipelineStage::kVertex;
+    case ShaderStage::Compute: return tint::inspector::PipelineStage::kCompute;
+    default: return tint::inspector::PipelineStage::kFragment;
+    }
+}
 
 }  // namespace
 
@@ -60,8 +73,7 @@ TranslateResult wgsl_to_glsl(const std::string& wgsl, const std::string& entryPo
         if (ep.name == entryPoint) {
             found = true;
             r.immediateSize = ep.immediate_data_size;
-            const bool wantVertex = stage == ShaderStage::Vertex;
-            if ((ep.stage == tint::inspector::PipelineStage::kVertex) != wantVertex) {
+            if (ep.stage != tint_stage(stage)) {
                 r.error = "entry point " + entryPoint + " is not of the requested stage";
                 return r;
             }
@@ -88,7 +100,7 @@ TranslateResult wgsl_to_glsl(const std::string& wgsl, const std::string& entryPo
     std::sort(resources.begin(), resources.end(), [](const RB& a, const RB& b) {
         return std::tie(a.bind_group, a.binding) < std::tie(b.bind_group, b.binding);
     });
-    uint32_t nextUbo = 0, nextSsbo = 0;
+    uint32_t nextUbo = 0, nextSsbo = 0, nextImage = 0;
     for (const RB& res : resources) {
         const BindingPoint wgslBp{res.bind_group, res.binding};
         if (is_uniform(res.resource_type) || is_storage(res.resource_type)) {
@@ -111,6 +123,15 @@ TranslateResult wgsl_to_glsl(const std::string& wgsl, const std::string& entryPo
         } else if (is_texture(res.resource_type)) {
             // the post-remapping number only names the pair below; uam sees the post-pass binding
             options.bindings.texture.emplace(wgslBp, BindingPoint{0, res.bind_group * 64 + res.binding});
+        } else if (is_storage_texture(res.resource_type) && scheme == BindingScheme::Sequential) {
+            const uint32_t slot = nextImage++;
+            if (slot >= 8) {
+                r.error = "no image slot for storage texture @group(" + std::to_string(res.bind_group) +
+                          ") @binding(" + std::to_string(res.binding) + ")";
+                return r;
+            }
+            options.bindings.storage_texture.emplace(wgslBp, BindingPoint{0, slot});
+            r.bindings.push_back({SlotBinding::Kind::Image, uint8_t(slot), res.bind_group, res.binding});
         } else if (res.resource_type == RB::ResourceType::kSampler) {
             options.bindings.sampler.emplace(wgslBp, BindingPoint{0, res.bind_group * 64 + res.binding});
         } else {
@@ -152,6 +173,8 @@ TranslateResult wgsl_to_glsl(const std::string& wgsl, const std::string& entryPo
             tint::glsl::writer::CombinedTextureSamplerPair{texRemapped, smpRemapped, false}, name);
         samplerSlots.push_back({name, slot});
         r.bindings.push_back({SlotBinding::Kind::Sampler, uint8_t(slot), tex.group, tex.binding});
+        r.samplers.push_back(smp.group == kPlaceholderSamplerGroup ? SamplerSource{}
+                                                                    : SamplerSource{smp.group, smp.binding});
     }
     if (r.immediateSize) {
         r.bindings.push_back({SlotBinding::Kind::Immediates, uint8_t(kImmediatesUboSlot), 0, 0});
@@ -176,6 +199,29 @@ TranslateResult wgsl_to_glsl(const std::string& wgsl, const std::string& entryPo
     }
     r.ok = true;
     return r;
+}
+
+std::string entry_point_of(const std::string& wgsl, ShaderStage stage, std::string* error) {
+    tint::Source::File file("shader.wgsl", wgsl);
+    tint::wgsl::reader::Options readerOptions;
+    readerOptions.allowed_features = tint::wgsl::AllowedFeatures::Everything();
+    tint::Program program = tint::wgsl::reader::Parse(&file, readerOptions);
+    if (!program.IsValid()) {
+        *error = "WGSL: " + program.Diagnostics().Str();
+        return {};
+    }
+    tint::inspector::Inspector inspector(program);
+    std::string name;
+    for (const auto& ep : inspector.GetEntryPoints()) {
+        if (ep.stage != tint_stage(stage)) continue;
+        if (!name.empty()) {
+            *error = "more than one entry point of the stage and none named";
+            return {};
+        }
+        name = ep.name;
+    }
+    if (name.empty()) *error = "no entry point of the stage";
+    return name;
 }
 
 bool post_pass(std::string* glsl, const std::vector<SamplerSlot>& samplerSlots, std::string* error) {

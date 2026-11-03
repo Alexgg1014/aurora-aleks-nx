@@ -7,6 +7,7 @@
 // Changed for Dusklight Switch (aleks2 deko3d P1, from SwitchWaker 084291f switch/deko/shaders.cpp):
 // dksh_local.bin and the failure dumps in sdmc:/switch/dusklight/cache; no thread role of SwitchWaker's
 // (the worker keeps the default core mask, at priority 0x3B).
+// v1.1 (aleks2, mods' gfx service on deko3d): a third registry for compute shaders.
 // The deko3d renderer's shaders at run time (dk.h, docs/DEKO3D_MIGRATION_PLAN.md section 6):
 //   - the registry: every DKSH by (stage, GLSL hash), filled from initial_dksh_cache.bin and
 //     dksh_local.bin at start (shader_cache.cpp, shaders_init) and by the uam worker;
@@ -50,11 +51,11 @@ constexpr const char* kFailDir = COS_SWITCH_DATA_DIR "/cache";
 constexpr size_t kWorkerStack = 8u << 20;  // Mesa's GLSL parser and nv50_ir recurse deeply (uam_api.h)
 constexpr int kFailDumps = 16;
 
-int stage_index(ShaderStage s) { return s == ShaderStage::Vertex ? 0 : 1; }
+int stage_index(ShaderStage s) { return s == ShaderStage::Vertex ? 0 : s == ShaderStage::Compute ? 2 : 1; }
 
 // ---- the registry
 std::mutex g_mutex;
-std::unordered_map<uint64_t, std::unique_ptr<ShaderEntry>> g_entries[2];
+std::unordered_map<uint64_t, std::unique_ptr<ShaderEntry>> g_entries[3];
 std::unordered_map<uint64_t, ModuleHashes> g_modules;
 
 // ---- the worker
@@ -78,7 +79,9 @@ int g_failDumps = 0;
 uint32_t g_budget = 64;
 uint32_t g_loadsThisFrame = 0;
 
-const char* stage_name(ShaderStage s) { return s == ShaderStage::Vertex ? "vertex" : "fragment"; }
+const char* stage_name(ShaderStage s) {
+    return s == ShaderStage::Vertex ? "vertex" : s == ShaderStage::Compute ? "compute" : "fragment";
+}
 
 void append_local(const ShaderEntry& e, const std::vector<uint8_t>& dksh) {
     // the header once (a file of another compiler is replaced at start), then the record
@@ -107,7 +110,7 @@ void dump_failure(const ShaderEntry& e, const std::string& glsl, const std::stri
     g_failDumps++;
     char path[256];
     snprintf(path, sizeof path, "%s/shaderfail_%016llx_%s.glsl", kFailDir, (unsigned long long)e.glslHash,
-             e.stage == ShaderStage::Vertex ? "vs" : "fs");
+             e.stage == ShaderStage::Vertex ? "vs" : e.stage == ShaderStage::Compute ? "cs" : "fs");
     if (FILE* f = fopen(path, "wb")) {
         fwrite(glsl.data(), 1, glsl.size(), f);
         fprintf(f, "\n/* uam:\n%s\n*/\n", log.c_str());
@@ -151,8 +154,10 @@ void* worker_main(void*) {
         }
         ShaderEntry* e = job.entry;
         const uint64_t c0 = now_ns();
-        uam::Result res = uam::compile(e->stage == ShaderStage::Vertex ? uam::Stage::Vertex : uam::Stage::Fragment,
-                                       job.glsl.c_str());
+        const uam::Stage stage = e->stage == ShaderStage::Vertex    ? uam::Stage::Vertex
+                                 : e->stage == ShaderStage::Compute ? uam::Stage::Compute
+                                                                    : uam::Stage::Fragment;
+        uam::Result res = uam::compile(stage, job.glsl.c_str());
         const uint64_t ns = now_ns() - c0;
         const bool ok = res.ok && !res.dksh.empty();
         if (ok) {
@@ -293,10 +298,10 @@ bool shader_wait(ShaderEntry* e) {
     return e->state.load(std::memory_order_acquire) != ShaderState::Failed;
 }
 
-bool shader_usable(ShaderEntry* e) {
+bool shader_usable(ShaderEntry* e, bool force) {
     const ShaderState s = e->state.load(std::memory_order_acquire);
     if (s == ShaderState::Ready) return true;
-    if (s == ShaderState::Compiled && (g_budget == 0 || g_loadsThisFrame < g_budget)) {
+    if (s == ShaderState::Compiled && (force || g_budget == 0 || g_loadsThisFrame < g_budget)) {
         std::vector<uint8_t> dksh;
         {
             std::lock_guard<std::mutex> lock(g_jobMutex);
@@ -305,6 +310,7 @@ bool shader_usable(ShaderEntry* e) {
         g_loadsThisFrame++;
         char name[48];
         snprintf(name, sizeof name, "%s %016llx", stage_name(e->stage), (unsigned long long)e->glslHash);
+        e->scratch = dksh.empty() ? 0 : dksh_scratch(dksh.data(), uint32_t(dksh.size()));
         if (!dksh.empty() && code_load(e->shader, dksh.data(), uint32_t(dksh.size()), name)) {
             e->state.store(ShaderState::Ready, std::memory_order_release);
             g_loaded++;

@@ -1,6 +1,6 @@
 // Adapted from SwitchWaker (MIT), 084291f: switch/deko/aurora/dk_encode.cpp. Changes for Dusklight
 // (aleks2 deko3d P1): RmlUi's draws (dk_rmlui.cpp), no EFB content scale (this Aurora has none), debug
-// markers only with AURORA_GFX_DEBUG_GROUPS, mods' runtime draw types and encoder tasks skipped (logged).
+// markers only with AURORA_GFX_DEBUG_GROUPS; v1.1: mods' runtime draw types and encoder tasks (dk_modgfx.cpp).
 //
 // Aurora's recorded frame to deko3d commands (dk_gfx.hpp; docs/DEKO3D_MIGRATION_PLAN.md phase 3), on
 // the render worker: the work encoding.cpp gives Dawn, op by op as Aurora seals them.
@@ -41,12 +41,14 @@
 #include "dk_aurora.h"
 
 #include "dk_gfx.hpp"
+#include "dk_modgfx.hpp"
 
 #include "gfx/clear.hpp"
 #include "gfx/depth_peek.hpp"
 #include "gfx/frame.hpp"
 #include "gfx/pipeline_cache.hpp"
 #include "gfx/resource_cache.hpp"
+#include "gfx/resources.hpp"
 #include "gfx/tex_copy_conv.hpp"
 #include "gfx/tex_palette_conv.hpp"
 #include "gfx/texture.hpp"
@@ -111,6 +113,7 @@ struct Cache {
     DkBlendState bs{};
     DkDepthStencilState ds{};
     float bias[3] = {};
+    bool biased = false;  // aleks2 (v1.1-perf-lab): the last bound pipeline had depth bias (zcull invalidate below)
     bool vpValid = false, scValid = false, blendValid = false, immValid = false;
     DkViewport vp{};
     DkScissor sc{};
@@ -288,6 +291,21 @@ void bind_pipe(const Pipe* p) {
     if (changed(g_cache.cwValid, g_cache.cw, p->colorWrite)) dkCmdBufBindColorWriteState(R.cmd, &p->colorWrite);
     if (changed(g_cache.bsValid, g_cache.bs, p->blend)) dkCmdBufBindBlendStates(R.cmd, 0, &p->blend, 1);
     if (changed(g_cache.dsValid, g_cache.ds, p->depthStencil)) dkCmdBufBindDepthStencilState(R.cmd, &p->depthStencil);
+    // aleks2 (v1.1-perf-lab): with zcull on (COS_DK_ZCULL=1), drop zcull's tile data before each run of depth-biased
+    // draws: its per-tile depth range comes from unbiased draws, so a biased decal could lose whole 4x8-pixel tiles.
+    // Idea from SwitchWakerHD #78 (754ab3b, "zcull on by default with a Zcull invalidate before depth-biased draws";
+    // our own code). COS_DK_ZCULL_BIAS_FIX=0 leaves it out, for A/B.
+    {
+        static const bool biasFix = [] {
+            const char* e = getenv("COS_DK_ZCULL_BIAS_FIX");
+            return !(e && *e == '0');
+        }();
+        const bool biased = p->rasterizer.depthBiasEnableMask != 0;
+        if (biased && !g_cache.biased && R.zcull && biasFix) {
+            dkCmdBufBarrier(R.cmd, DkBarrier_None, DkInvalidateFlags_Zcull);
+        }
+        g_cache.biased = biased;
+    }
     if (p->rasterizer.depthBiasEnableMask) {
         float bias[3];
         memcpy(bias, p->depthBias, sizeof bias);
@@ -947,10 +965,19 @@ void encode_pass(FramePacket& frame, RenderPass& pass) {
         }
     }
     g_frame.workSinceTransfer = true;
+    // v1.1: what a mod's draw finds bound and what is put back after it (encoding.cpp does the same)
+    const Viewport* lastViewport = nullptr;
+    const ClipRect* lastScissor = nullptr;
     for (auto& c : pass.commands) {
         switch (c.type) {
-        case CommandType::SetViewport: apply_viewport(c.data.setViewport); break;
-        case CommandType::SetScissor: apply_scissor(c.data.setScissor, tw, th); break;
+        case CommandType::SetViewport:
+            apply_viewport(c.data.setViewport);
+            lastViewport = &c.data.setViewport;
+            break;
+        case CommandType::SetScissor:
+            apply_scissor(c.data.setScissor, tw, th);
+            lastScissor = &c.data.setScissor;
+            break;
         case CommandType::Draw:
             if (c.data.draw.encoder == nullptr) break;
             switch (draw_kind(c.data.draw.encoder)) {
@@ -970,8 +997,21 @@ void encode_pass(FramePacket& frame, RenderPass& pass) {
             }
             break;
         case CommandType::CustomDraw:
-            log_once("a runtime-registered draw type (a mod's gfx service draw: not drawn with deko3d)");
-            g_stats.skippedOther++;
+            modgfx_custom_draw(c.data.customDraw, pass, tw, th);
+            g_frame.workSinceTransfer = true;
+            set_swizzle(swdk::C.flipY);
+            if (lastViewport) {
+                apply_viewport(*lastViewport);
+            } else {
+                const DkViewport v = {0.f, 0.f, float(tw), float(th), 0.f, 1.f};
+                dkCmdBufSetViewports(R.cmd, 0, &v, 1);
+            }
+            if (lastScissor) {
+                apply_scissor(*lastScissor, tw, th);
+            } else {
+                const DkScissor s = {0, 0, tw, th};
+                dkCmdBufSetScissors(R.cmd, 0, &s, 1);
+            }
             break;
         case CommandType::DebugMarker:
 #ifdef AURORA_GFX_DEBUG_GROUPS
@@ -1186,6 +1226,7 @@ void frame_begin(FramePacket& frame) {
     // engine waits for them (the queue orders submissions, not engines)
     g_frame.workSinceTransfer = true;
     g_frame.staging = g_staging[frame.stagingBuffer].block.gpu;
+    modgfx_frame_begin(frame);  // v1.1
     const swdk::StreamAlloc imm = swdk::stream_alloc(kImmediatesSize, DK_UNIFORM_BUF_ALIGNMENT);
     g_frame.immediates = imm.gpu;
     if (imm) memset(imm.cpu, 0, kImmediatesSize);
@@ -1199,6 +1240,7 @@ void encode_op(FramePacket& frame, const FrameOp& op) {
     const uint64_t t0 = swdk::now_ns();
     clean_staging(frame, op);  // aleks2 (V1, COS_DK_CACHED_UPLOAD): before anything below reads the slot
     do_uploads(op);
+    modgfx_flush_writes();  // v1.1
     switch (op.type) {
     case FrameOpType::RenderPass:
         if (op.renderPass) encode_pass(frame, *op.renderPass);
@@ -1207,10 +1249,31 @@ void encode_op(FramePacket& frame, const FrameOp& op) {
         if (op.textureCopy) texture_copy(*op.textureCopy);
         break;
     case FrameOpType::EncoderTask:
-        if (op.encoderTask) log_once("an encoder task (a mod's gfx service task: not run with deko3d)");
+        if (op.encoderTask) {
+            modgfx_encoder_task(frame, *op.encoderTask);
+            g_frame.workSinceTransfer = true;
+        }
         break;
     }
     g_stats.encodeNs += swdk::now_ns() - t0;
+}
+
+bool shared_buffer_range(WGPUBuffer buffer, DkGpuAddr& addr, uint64_t& size) {
+    if (!buffer || !g_frame.open) return false;
+    const auto& res = resources();
+    const DkGpuAddr s = g_frame.staging;
+    if (buffer == res.vertexBuffer.Get()) {
+        addr = s + kVertexOffset, size = VertexBufferSize;
+    } else if (buffer == res.uniformBuffer.Get()) {
+        addr = s + kUniformOffset, size = UniformBufferSize;
+    } else if (buffer == res.indexBuffer.Get()) {
+        addr = s + kIndexOffset, size = IndexBufferSize;
+    } else if (buffer == res.storageBuffer.Get()) {
+        addr = s + kStorageOffset, size = StorageBufferSize;
+    } else {
+        return false;
+    }
+    return true;
 }
 
 OverflowUpload overflow_upload(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage) {

@@ -15,6 +15,13 @@
 
 #include <tracy/Tracy.hpp>
 
+#if defined(__SWITCH__)
+#include <switch.h>
+#endif
+
+// aleks2 (v1.1-perf-lab): the worker's kernel handle, for the game's sampling profiler (aurora_gx_fifo_thread_handle).
+static std::atomic<uint32_t> sWorkerHandle{0};
+
 namespace aurora::gx::fifo {
 namespace detail {
 uint8_t* sBufferData = nullptr;
@@ -42,6 +49,13 @@ thread::Thread sWorkerThread;
 std::atomic<DrawDoneCallback> sDrawDoneCallback{nullptr};
 // aleks2 (H35): telemetry only; see fifo_stats.hpp.
 stats::Counters sStats;
+// aleks2 (v1.1-perf-lab-3): fifo_quiet (aurora_gx_set_fifo_quiet). A thread about to sleep on sWorkerWake or
+// sProcessed says so first; the other side notifies only then. Each side stores, fences, then loads the other's flag
+// or position (Dekker), so a wake-up is never lost; the waits compare a value, so a late notify only costs a spurious
+// return.
+std::atomic<bool> sQuiet{true};  // aleks2 (v1.1-beta2): on by default
+std::atomic<bool> sWorkerSleeping{false};
+std::atomic<uint32_t> sDrainWaiters{0};
 DrainSite sDrainTag = kUntagged; // game thread only
 
 uint64_t now_ns() noexcept {
@@ -59,7 +73,23 @@ void dispatch_draw_done() noexcept {
 void wake_worker() noexcept {
   stats::add(sStats.producer.wakeRequests, 1);
   sWorkerWake.fetch_add(1, std::memory_order_release);
+  if (sQuiet.load(std::memory_order_relaxed)) {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!sWorkerSleeping.load(std::memory_order_relaxed)) {
+      return;
+    }
+  }
   sWorkerWake.notify_all();
+}
+
+void notify_processed() noexcept {
+  if (sQuiet.load(std::memory_order_relaxed)) {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (sDrainWaiters.load(std::memory_order_relaxed) == 0) {
+      return;
+    }
+  }
+  sProcessed.notify_all();
 }
 
 void process_to(uint64_t target, std::memory_order order) noexcept {
@@ -85,12 +115,15 @@ void process_to(uint64_t target, std::memory_order order) noexcept {
     }
     processed += result.bytesProcessed;
     sProcessed.store(processed, order);
-    sProcessed.notify_all();
+    notify_processed();
   }
 }
 
 void worker_main(std::stop_token token) noexcept {
   std::stop_callback wakeOnStop{token, wake_worker};
+#if defined(__SWITCH__)
+  sWorkerHandle.store(threadGetCurHandle(), std::memory_order_release);
+#endif
   while (true) {
     const uint32_t event = sWorkerWake.load(std::memory_order_acquire);
     const uint64_t processed = sProcessed.load(std::memory_order_relaxed);
@@ -104,7 +137,13 @@ void worker_main(std::stop_token token) noexcept {
       break;
     }
     stats::add(sStats.worker.sleeps, 1);
-    sWorkerWake.wait(event, std::memory_order_acquire);
+    sWorkerSleeping.store(true, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (sWorkerWake.load(std::memory_order_relaxed) == event &&
+        sPublished.load(std::memory_order_relaxed) == processed && !token.stop_requested()) {
+      sWorkerWake.wait(event, std::memory_order_acquire);
+    }
+    sWorkerSleeping.store(false, std::memory_order_relaxed);
   }
 }
 
@@ -287,10 +326,14 @@ void drain(DrainSite site) {
     if (processed < target) {
       waited = true;
       const uint64_t start = now_ns();
-      do {
+      sDrainWaiters.fetch_add(1, std::memory_order_relaxed);
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      processed = sProcessed.load(std::memory_order_acquire);
+      while (processed < target) {
         sProcessed.wait(processed, std::memory_order_acquire);
         processed = sProcessed.load(std::memory_order_acquire);
-      } while (processed < target);
+      }
+      sDrainWaiters.fetch_sub(1, std::memory_order_relaxed);
       waitNs = now_ns() - start;
     }
     break;
@@ -307,6 +350,18 @@ void drain(DrainSite site) {
 }
 
 stats::Counters& counters() noexcept { return sStats; }
+
+} // namespace aurora::gx::fifo
+
+extern "C" void aurora_gx_set_fifo_quiet(bool on) {
+  aurora::gx::fifo::sQuiet.store(on, std::memory_order_relaxed);
+  // Whoever may be asleep under the old rule is woken once under the new one.
+  aurora::gx::fifo::sWorkerWake.fetch_add(1, std::memory_order_release);
+  aurora::gx::fifo::sWorkerWake.notify_all();
+  aurora::gx::fifo::sProcessed.notify_all();
+}
+
+namespace aurora::gx::fifo {
 
 DrainSite set_drain_tag(DrainSite tag) noexcept {
   const DrainSite previous = sDrainTag;
@@ -335,6 +390,10 @@ extern "C" AuroraFifoDrainSite aurora_gx_fifo_set_drain_tag(AuroraFifoDrainSite 
   const DrainSite next = value < aurora::gx::fifo::kDrainSiteCount ? static_cast<DrainSite>(value)
                                                                    : aurora::gx::fifo::kUntagged;
   return static_cast<AuroraFifoDrainSite>(aurora::gx::fifo::set_drain_tag(next));
+}
+
+extern "C" uint32_t aurora_gx_fifo_thread_handle(void) {
+  return sWorkerHandle.load(std::memory_order_acquire);
 }
 
 extern "C" void aurora_gx_fifo_stats(AuroraFifoStats* out) {

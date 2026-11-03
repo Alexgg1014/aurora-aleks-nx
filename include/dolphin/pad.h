@@ -224,6 +224,11 @@ struct SDL_Gamepad* PADGetSDLGamepadForIndex(u32 index);
 s32 PADGetNativeButtonPressed(u32 port);
 /* Returns the first native axis which is currently pulled halfway or more */
 PADSignedNativeAxis PADGetNativeAxisPulled(u32 port);
+#ifdef __SWITCH__
+/* aleks2 (v1.1-beta.3): a native button saved before the console's pad became positional, on today's layout
+   (an SDL gamepad button or PAD_NATIVE_TRIGGER_*). */
+u32 PADSwitchLegacyNativeButton(u32 legacy);
+#endif
 void PADRestoreDefaultMapping(u32 port);
 void PADBlockInput(bool block);
 

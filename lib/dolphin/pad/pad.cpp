@@ -16,8 +16,12 @@
 namespace {
 constexpr aurora::Module Log{"aurora::input"};
 
-constexpr int32_t k_mappingsFileVersion = 4;
+// aleks2 (v1.1-beta.3): 5 is 4's format; it marks a Switch file saved with the console's positional layout
+// (platforms/switch/sdl, SDL_sysjoystick.c). Older Switch files are moved onto it when read.
+constexpr int32_t k_mappingsFileVersion = 5;
 constexpr int32_t k_minMappingsFileVersion = 3;
+constexpr int32_t k_forceDeviceRumbleVersion = 4;
+[[maybe_unused]] constexpr int32_t k_switchPositionalVersion = 5;
 
 std::array<PADButtonMapping, PAD_BUTTON_COUNT> g_defaultButtonsStandard{{
     {SDL_GAMEPAD_BUTTON_SOUTH, PAD_BUTTON_A},
@@ -244,6 +248,74 @@ std::array<PADAxisMapping, PAD_AXIS_COUNT> g_defaultAxes{{
     {{SDL_GAMEPAD_AXIS_LEFT_TRIGGER, AXIS_SIGN_POSITIVE}, SDL_GAMEPAD_BUTTON_INVALID, PAD_AXIS_TRIGGER_L},
     {{SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, AXIS_SIGN_POSITIVE}, SDL_GAMEPAD_BUTTON_INVALID, PAD_AXIS_TRIGGER_R},
 }};
+
+#ifdef __SWITCH__
+// aleks2 (v1.1-beta.3): the console's own pad (platforms/switch/sdl) has SDL's positional layout, so the buttons are
+// placed as printed: Switch A (EAST) is the GameCube A, B (SOUTH) its B, X (NORTH) its X, Y (WEST) its Y, L and R
+// (the shoulders) its L and R triggers, ZR (a trigger) its Z. That is what the port has always played like; only
+// the SDL names under it changed. ZL is left free, as before.
+std::array<PADButtonMapping, PAD_BUTTON_COUNT> g_defaultButtonsSwitchConsole{{
+    {SDL_GAMEPAD_BUTTON_EAST, PAD_BUTTON_A},
+    {SDL_GAMEPAD_BUTTON_SOUTH, PAD_BUTTON_B},
+    {SDL_GAMEPAD_BUTTON_NORTH, PAD_BUTTON_X},
+    {SDL_GAMEPAD_BUTTON_WEST, PAD_BUTTON_Y},
+    {SDL_GAMEPAD_BUTTON_START, PAD_BUTTON_START},
+    {PAD_NATIVE_TRIGGER_RIGHT, PAD_TRIGGER_Z},
+    {PAD_NATIVE_BUTTON_INVALID, PAD_TRIGGER_L},
+    {PAD_NATIVE_BUTTON_INVALID, PAD_TRIGGER_R},
+    {SDL_GAMEPAD_BUTTON_DPAD_UP, PAD_BUTTON_UP},
+    {SDL_GAMEPAD_BUTTON_DPAD_DOWN, PAD_BUTTON_DOWN},
+    {SDL_GAMEPAD_BUTTON_DPAD_LEFT, PAD_BUTTON_LEFT},
+    {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, PAD_BUTTON_RIGHT},
+}};
+
+std::array<PADAxisMapping, PAD_AXIS_COUNT> g_defaultAxesSwitchConsole{{
+    {{SDL_GAMEPAD_AXIS_LEFTX, AXIS_SIGN_POSITIVE}, SDL_GAMEPAD_BUTTON_INVALID, PAD_AXIS_LEFT_X_POS},
+    {{SDL_GAMEPAD_AXIS_LEFTX, AXIS_SIGN_NEGATIVE}, SDL_GAMEPAD_BUTTON_INVALID, PAD_AXIS_LEFT_X_NEG},
+    {{SDL_GAMEPAD_AXIS_LEFTY, AXIS_SIGN_NEGATIVE}, SDL_GAMEPAD_BUTTON_INVALID, PAD_AXIS_LEFT_Y_POS},
+    {{SDL_GAMEPAD_AXIS_LEFTY, AXIS_SIGN_POSITIVE}, SDL_GAMEPAD_BUTTON_INVALID, PAD_AXIS_LEFT_Y_NEG},
+    {{SDL_GAMEPAD_AXIS_RIGHTX, AXIS_SIGN_POSITIVE}, SDL_GAMEPAD_BUTTON_INVALID, PAD_AXIS_RIGHT_X_POS},
+    {{SDL_GAMEPAD_AXIS_RIGHTX, AXIS_SIGN_NEGATIVE}, SDL_GAMEPAD_BUTTON_INVALID, PAD_AXIS_RIGHT_X_NEG},
+    {{SDL_GAMEPAD_AXIS_RIGHTY, AXIS_SIGN_NEGATIVE}, SDL_GAMEPAD_BUTTON_INVALID, PAD_AXIS_RIGHT_Y_POS},
+    {{SDL_GAMEPAD_AXIS_RIGHTY, AXIS_SIGN_POSITIVE}, SDL_GAMEPAD_BUTTON_INVALID, PAD_AXIS_RIGHT_Y_NEG},
+    {{-1, AXIS_SIGN_POSITIVE}, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, PAD_AXIS_TRIGGER_L},
+    {{-1, AXIS_SIGN_POSITIVE}, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, PAD_AXIS_TRIGGER_R},
+}};
+
+const std::array<PADAxisMapping, PAD_AXIS_COUNT>& default_axes() { return g_defaultAxesSwitchConsole; }
+
+// A mapping saved before v1.1-beta.3 (file version < 5), when SDL's "a" was Switch A and L/R were the trigger axes,
+// read on today's layout. Every physical button keeps the action it had.
+void migrate_switch_legacy_mapping(std::array<PADButtonMapping, PAD_BUTTON_COUNT>& buttons,
+                                   std::array<PADAxisMapping, PAD_AXIS_COUNT>& axes) {
+  for (auto& mapping : buttons) {
+    mapping.nativeButton = PADSwitchLegacyNativeButton(mapping.nativeButton);
+  }
+  for (auto& mapping : axes) {
+    if (mapping.nativeAxis.nativeAxis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ||
+        mapping.nativeAxis.nativeAxis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
+      // Switch L or R, now buttons.
+      mapping.nativeButton = mapping.nativeAxis.nativeAxis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER
+                                 ? SDL_GAMEPAD_BUTTON_LEFT_SHOULDER
+                                 : SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER;
+      mapping.nativeAxis = {-1, AXIS_SIGN_POSITIVE};
+    } else if (mapping.nativeAxis.nativeAxis == -1 && mapping.nativeButton != -1) {
+      const u32 button = PADSwitchLegacyNativeButton(static_cast<u32>(mapping.nativeButton));
+      if (button == PAD_NATIVE_TRIGGER_LEFT || button == PAD_NATIVE_TRIGGER_RIGHT) {
+        // Switch ZL or ZR, now trigger axes.
+        mapping.nativeAxis = {button == PAD_NATIVE_TRIGGER_LEFT ? SDL_GAMEPAD_AXIS_LEFT_TRIGGER
+                                                                : SDL_GAMEPAD_AXIS_RIGHT_TRIGGER,
+                              AXIS_SIGN_POSITIVE};
+        mapping.nativeButton = -1;
+      } else {
+        mapping.nativeButton = static_cast<s32>(button);
+      }
+    }
+  }
+}
+#else
+const std::array<PADAxisMapping, PAD_AXIS_COUNT>& default_axes() { return g_defaultAxes; }
+#endif
 
 template <typename T, size_t N>
 constexpr const std::array<T, N>& toStdArray(const T (&array)[N]) {
@@ -486,6 +558,11 @@ void PADClearPort(const u32 port) {
 
 void __PADSetDefaultMapping(aurora::input::GameController* controller) /*  NOLINT(*-reserved-identifier) */
 {
+#ifdef __SWITCH__
+  // The console has one pad, its own; it reports as a Pro Controller only for the labels.
+  controller->m_buttonMapping = g_defaultButtonsSwitchConsole;
+  return;
+#endif
   switch (SDL_GetGamepadType(controller->m_controller)) {
   case SDL_GAMEPAD_TYPE_XBOX360:
     controller->m_buttonMapping = g_defaultButtonsXBox360;
@@ -535,7 +612,7 @@ void __PADLoadMapping(aurora::input::GameController* controller) /*  NOLINT(*-re
 
   if (!controller->m_mappingLoaded) {
     __PADSetDefaultMapping(controller);
-    controller->m_axisMapping = g_defaultAxes;
+    controller->m_axisMapping = default_axes();
   }
 
   controller->m_mappingLoaded = true;
@@ -593,7 +670,7 @@ void __PADLoadMapping(aurora::input::GameController* controller) /*  NOLINT(*-re
             aurora::io::read_exact(file.get(), axisMapping.data(), sizeof(axisMapping));
   if (!isGameCube) {
     ok = ok && SDL_ReadU16LE(file.get(), &rumbleIntensityLow) && SDL_ReadU16LE(file.get(), &rumbleIntensityHigh);
-    if (version >= k_mappingsFileVersion) {
+    if (version >= k_forceDeviceRumbleVersion) {
       uint8_t forceDeviceRumbleValue = 0;
       ok = ok && SDL_ReadU8(file.get(), &forceDeviceRumbleValue);
       forceDeviceRumble = forceDeviceRumbleValue != 0;
@@ -603,6 +680,13 @@ void __PADLoadMapping(aurora::input::GameController* controller) /*  NOLINT(*-re
     Log.warn("Unable to read controller bindings! Path: \"{}\"", aurora::io::fs_path_to_string(path));
     return;
   }
+#ifdef __SWITCH__
+  if (version < k_switchPositionalVersion) {
+    migrate_switch_legacy_mapping(buttonMapping, axisMapping);
+    Log.info("__PADLoadMapping port={}: bindings saved before v1.1-beta.3 moved onto the positional layout",
+             playerIndex);
+  }
+#endif
   controller->m_deadZones = deadZones;
   controller->m_buttonMapping = buttonMapping;
   controller->m_axisMapping = axisMapping;
@@ -619,7 +703,7 @@ void __PADLoadMapping(aurora::input::GameController* controller) /*  NOLINT(*-re
   }
   if (axisCorrupt) {
     Log.warn("__PADLoadMapping port={}: corrupt axis data in file, resetting axes to defaults", playerIndex);
-    controller->m_axisMapping = g_defaultAxes;
+    controller->m_axisMapping = default_axes();
   }
 
   bool buttonCorrupt = false;
@@ -1593,6 +1677,37 @@ const char* PADGetNativeAxisName(PADSignedNativeAxis axis) {
   return SDL_GetGamepadStringForAxis(static_cast<SDL_GamepadAxis>(axis.nativeAxis));
 }
 
+#ifdef __SWITCH__
+u32 PADSwitchLegacyNativeButton(const u32 legacy) {
+  // Before v1.1-beta.3 the console's pad said "a" for Switch A and kept L/R as the triggers, ZL/ZR as the
+  // shoulders, and L R ZL ZR once more as MISC1..4 (platforms/switch/sdl, SDL_sysjoystick.c).
+  switch (legacy) {
+  case SDL_GAMEPAD_BUTTON_SOUTH:  // Switch A
+    return SDL_GAMEPAD_BUTTON_EAST;
+  case SDL_GAMEPAD_BUTTON_EAST:  // Switch B
+    return SDL_GAMEPAD_BUTTON_SOUTH;
+  case SDL_GAMEPAD_BUTTON_WEST:  // Switch X
+    return SDL_GAMEPAD_BUTTON_NORTH;
+  case SDL_GAMEPAD_BUTTON_NORTH:  // Switch Y
+    return SDL_GAMEPAD_BUTTON_WEST;
+  case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:  // Switch ZL
+  case SDL_GAMEPAD_BUTTON_MISC3:
+    return PAD_NATIVE_TRIGGER_LEFT;
+  case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:  // Switch ZR
+  case SDL_GAMEPAD_BUTTON_MISC4:
+    return PAD_NATIVE_TRIGGER_RIGHT;
+  case SDL_GAMEPAD_BUTTON_MISC1:  // Switch L
+  case PAD_NATIVE_TRIGGER_LEFT:
+    return SDL_GAMEPAD_BUTTON_LEFT_SHOULDER;
+  case SDL_GAMEPAD_BUTTON_MISC2:  // Switch R
+  case PAD_NATIVE_TRIGGER_RIGHT:
+    return SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER;
+  default:
+    return legacy;
+  }
+}
+#endif
+
 int32_t PADGetNativeButtonPressed(const u32 port) {
   const auto* controller = aurora::input::get_controller_for_player(port);
   if (controller == nullptr) {
@@ -1636,7 +1751,7 @@ void PADRestoreDefaultMapping(const u32 port) {
     return;
   }
   __PADSetDefaultMapping(controller);
-  controller->m_axisMapping = g_defaultAxes;
+  controller->m_axisMapping = default_axes();
 }
 
 void PADBlockInput(const bool block) {

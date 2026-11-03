@@ -132,7 +132,8 @@ target_sources(aurora_gx PRIVATE
         "${_dk_lib_dir}/dk_pipeline.cpp"
         "${_dk_lib_dir}/dk_encode.cpp"
         "${_dk_lib_dir}/dk_present.cpp"
-        "${_dk_lib_dir}/dk_rmlui.cpp")
+        "${_dk_lib_dir}/dk_rmlui.cpp"
+        "${_dk_lib_dir}/dk_modgfx.cpp")  # v1.1: mods' gfx service
 target_include_directories(aurora_gx PRIVATE "${_dk_lib_dir}" "${_dk_lib_dir}/mpl" "${CMAKE_CURRENT_LIST_DIR}/../lib")
 target_include_directories(aurora_core PRIVATE "${_dk_lib_dir}" "${_dk_lib_dir}/mpl")
 

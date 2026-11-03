@@ -284,6 +284,11 @@ u8 line_mode_for_prim(GXPrimitive prim) noexcept {
 }
 } // namespace
 
+// aleks2 (v1.1-perf-lab): the index scratch of handle_draw_unmerged and of the merge path, at namespace scope rather
+// than function-local statics, so a draw does not pay the init-guard check (idea from KartPadNX; our own change).
+static ByteBuffer g_unmergedIdxBuf;
+static ByteBuffer g_mergeIdxBuf;
+
 static void handle_draw(u8 cmd, ByteReader& reader) noexcept;
 static void handle_aurora(ByteReader& reader) noexcept;
 
@@ -752,7 +757,7 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
     numIndices = static_cast<u16>(count);
   } else if (prim != GX_TRIANGLES) {
     ZoneScopedN("build idx buffer");
-    static ByteBuffer idxBuf;
+    auto& idxBuf = g_unmergedIdxBuf;
     numIndices = prepare_idx_buffer(idxBuf, prim, 0, vtxCount);
     idxRange = gfx::push_indices(idxBuf.data(), idxBuf.size(), 4);
     idxBuf.clear();
@@ -834,7 +839,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
   if (canMerge) {
     u32 numIndices = 0;
     gfx::Range idxRange;
-    static ByteBuffer idxBuf;
+    auto& idxBuf = g_mergeIdxBuf;
     const bool hadIndexRange = lastDraw->idxRange.size != 0;
     const bool directIdx = (g_fifoFast.load(std::memory_order_relaxed) & AURORA_FIFO_FAST_DIRECT_INDICES) != 0;
     if (directIdx) {

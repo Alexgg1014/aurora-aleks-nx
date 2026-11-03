@@ -42,6 +42,7 @@
 // five; the shared WebGPU buffers shrink to 64 KiB (only the Null device's bind groups use them).
 #include "dk_encode.hpp"
 #include "dk_gfx.hpp"
+#include "dk_modgfx.hpp"
 #include "dk_runtime.hpp"
 #endif
 
@@ -177,6 +178,11 @@ void process_events() {
   if (g_instance) {
     g_instance.ProcessEvents();
   }
+#ifdef AURORA_GFX_DEKO3D
+  if (dk::active()) {
+    dk::modgfx_process_events();  // v1.1: mods' MapAsync callbacks (dk_modgfx.cpp)
+  }
+#endif
 }
 
 void enqueue_process_events() {

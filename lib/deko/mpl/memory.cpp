@@ -490,6 +490,23 @@ static std::atomic<bool> g_codeWritten{false};
 
 bool code_take_written() { return g_codeWritten.exchange(false, std::memory_order_acq_rel); }
 
+uint32_t dksh_scratch(const void* dksh, uint32_t size) {
+    if (size < sizeof(DkshHeader)) return 0;
+    const uint8_t* p = static_cast<const uint8_t*>(dksh);
+    DkshHeader h;
+    memcpy(&h, p, sizeof h);
+    if (h.magic != kDkshMagic || h.num_programs == 0 || h.control_sz > size) return 0;
+    uint32_t scratch = 0;
+    for (uint32_t i = 0; i < h.num_programs; i++) {
+        const uint64_t at = uint64_t(h.programs_off) + uint64_t(i) * sizeof(DkshProgram);
+        if (at + sizeof(DkshProgram) > h.control_sz) break;
+        DkshProgram prog;
+        memcpy(&prog, p + at, sizeof prog);
+        scratch = std::max(scratch, prog.per_warp_scratch_sz);
+    }
+    return scratch;
+}
+
 bool code_load(DkShader& shader, const void* dksh, uint32_t size, const char* name) {
     std::lock_guard<std::mutex> lock(g_codeMutex);
     const uint32_t at = align_up(g_codeUsed, DK_SHADER_CODE_ALIGNMENT);

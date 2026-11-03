@@ -82,6 +82,15 @@ void write_image_view_descriptor(uint32_t slot, const DkImageView& view) {
     g_stats.imageWrites++;
 }
 
+// v1.1 (aleks2): the same with load/store usage, for a storage texture of a mod's shader (dk_modgfx.cpp)
+void write_storage_image_descriptor(uint32_t slot, const DkImageView& view) {
+    DkImageDescriptor d;
+    dkImageDescriptorInitialize(&d, &view, true, false);
+    dkCmdBufPushData(R.cmd, image_descriptors() + slot * sizeof(DkImageDescriptor), &d, sizeof d);
+    push_descriptor_barrier();
+    g_stats.imageWrites++;
+}
+
 uint32_t image_slot_alloc() {
     uint32_t slot = 0;
     if (!g_freeImages.empty()) {

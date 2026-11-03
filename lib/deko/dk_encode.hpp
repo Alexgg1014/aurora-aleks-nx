@@ -43,6 +43,9 @@ struct EncodeStats {
     uint64_t gpuFrames = 0, gpuNs[size_t(GpuWork::Count)] = {}, gpuTotalNs = 0, gpuDropped = 0;
 };
 EncodeStats& encode_stats();
+// v1.1 (dk_modgfx.cpp): one of Aurora's shared streaming buffers (Resources' vertex, uniform, index, storage)
+// as this frame's staging region; false for any other buffer or outside a frame (render worker)
+bool shared_buffer_range(WGPUBuffer buffer, DkGpuAddr& addr, uint64_t& size);
 
 // aleks2 (deko3d P1): RmlUi's draws (dk_rmlui.cpp). One rmlui::DrawData payload into the bound pass; the
 // frame's staging block at `staging` holds its vertices, indices and uniforms. Binds its own state

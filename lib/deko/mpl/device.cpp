@@ -513,14 +513,21 @@ extern "C" void aurora_switch_dk_init(uint32_t gxConfigVersion) {
     // with it, and the GL path's driver (Mesa nouveau) never enables it (plan section 7.5)
     const char* zcull = getenv("COS_DK_ZCULL");
     R.zcull = zcull && *zcull && *zcull != '0';
-    qm.flags = DkQueueFlags_Graphics | DkQueueFlags_MediumPrio |
+    // v1.1 (aleks2): DkQueueFlags_Compute too, for mods' compute passes (dk_modgfx.cpp); without it the queue has no
+    // compute side and the first dispatch reads a null pointer in ComputeQueue::bindShader (seen in Nextendo)
+    qm.flags = DkQueueFlags_Graphics | DkQueueFlags_Compute | DkQueueFlags_MediumPrio |
                (R.zcull ? DkQueueFlags_EnableZcull : DkQueueFlags_DisableZcull);
     qm.commandMemorySize = kQueueCommandMemory;
+    // v1.1 (aleks2): 18 KiB of scratch per warp (default 2) for mods' shaders, see kPerWarpScratch (dk.h). 4 KiB
+    // crashed Twilit Essentials 3's realistic water: its 34 KiB compute shader made deko3d abort ("not enough scratch
+    // memory to run compute shaders"), seen on a tester's console and in Nextendo. Shaders that still do not fit are
+    // refused (dk_modgfx.cpp usable()) and the mod moves to Vulkan.
+    qm.perWarpScratchMemorySize = kPerWarpScratch;
     qm.flushThreshold = qm.commandMemorySize / 8;
     dklog("creating the queue");
     log_flush();
     R.queue = dkQueueCreate(&qm);
-    dklog("queue created: graphics, command memory %u KiB, zcull %s", qm.commandMemorySize >> 10,
+    dklog("queue created: graphics and compute, command memory %u KiB, zcull %s", qm.commandMemorySize >> 10,
           R.zcull ? "ON (COS_DK_ZCULL=1)" : "off (COS_DK_ZCULL=1 turns it on)");
 
     C.flipY = env_flag("COS_DK_FLIP_Y", false);

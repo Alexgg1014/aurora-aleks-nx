@@ -1,6 +1,7 @@
 #include "CardGciFolder.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 
 #include <SDL3/SDL_filesystem.h>
@@ -538,6 +539,24 @@ bool CardGciFolder::open(const std::filesystem::path& filepath) {
     return false;
   }
 
+  // aleks2: a valid save whose filename is not the canonical one -- a player copied it in as
+  // "01-GZ2E-gczelda2 (1).gci" or "...gczelda2.GCI", or renamed another region's save -- used to
+  // be skipped at debug level, so the game started a new file and the release log said nothing
+  // (and a ".GCI" one then made createFile fail, as that path is the canonical file on a
+  // case-insensitive card). These are renamed to their canonical name after the scan, unless a
+  // file already holds that name.
+  struct Stray {
+    std::filesystem::path path;
+    File file;
+    size_t fileSize;
+    std::string canonicalName;
+  };
+  std::vector<Stray> strays;
+  const auto lower = [](std::string s) {
+    std::ranges::transform(s, s.begin(), [](unsigned char c) { return std::tolower(c); });
+    return s;
+  };
+
   const std::filesystem::directory_iterator end;
   while (it != end) {
     const auto entry = *it;
@@ -547,14 +566,10 @@ bool CardGciFolder::open(const std::filesystem::path& filepath) {
       return false;
     }
     const auto path = entry.path();
-    if (path.extension() != ".gci") {
+    if (lower(io::fs_path_to_string(path.extension())) != ".gci") {
       continue;
     }
     const auto diskName = io::fs_path_to_string(path.filename());
-    if (!is_gci_filename(diskName)) {
-      Log.debug("Ignoring GCI file with a noncanonical filename: '{}'", io::fs_path_to_string(path));
-      continue;
-    }
     const auto status = entry.status(ec);
     if (ec) {
       Log.warn("Failed to inspect GCI folder entry '{}': {}", io::fs_path_to_string(path), ec.message());
@@ -587,13 +602,9 @@ bool CardGciFolder::open(const std::filesystem::path& filepath) {
     const auto canonicalName = gci_filename({reinterpret_cast<const char*>(fileData.m_game), 4},
                                             {reinterpret_cast<const char*>(fileData.m_maker), 2},
                                             {fileData.m_filename, static_cast<size_t>(nameEnd - fileData.m_filename)});
-    if (canonicalName != diskName) {
-      Log.debug("Ignoring GCI file whose filename does not match its CARD identity: '{}'", io::fs_path_to_string(path));
+    if (canonicalName.empty()) {
+      Log.warn("Skipping GCI file with an invalid CARD identity in its header: '{}'", io::fs_path_to_string(path));
       continue;
-    }
-    if (files.size() == MaxFiles) {
-      m_error = ECardResult::BROKEN;
-      return false;
     }
     const auto fileSize = SDL_GetIOSize(file.get());
     if (fileSize < static_cast<Sint64>(sizeof(File)) || fileData.m_blockCount == 0 ||
@@ -601,7 +612,45 @@ bool CardGciFolder::open(const std::filesystem::path& filepath) {
       Log.warn("Skipping GCI file with invalid size: '{}'", io::fs_path_to_string(path));
       continue;
     }
+    if (canonicalName != diskName) {
+      strays.push_back({path, fileData, static_cast<size_t>(fileSize), canonicalName});
+      continue;
+    }
+    if (files.size() == MaxFiles) {
+      m_error = ECardResult::BROKEN;
+      return false;
+    }
     files.push_back({fileData, static_cast<size_t>(fileSize), path.filename().u8string(), false});
+  }
+
+  for (auto& stray : strays) {
+    const auto strayName = io::fs_path_to_string(stray.path.filename());
+    const auto destination = filepath / io::fs_path_from_string(stray.canonicalName);
+    if (files.size() == MaxFiles) {
+      Log.warn("Ignoring GCI file '{}': the card already holds {} files", strayName, MaxFiles);
+      continue;
+    }
+    const bool taken = std::ranges::any_of(files, [&](const GciFile& file) {
+      return lower(io::fs_path_to_string(std::filesystem::path{file.filename})) == lower(stray.canonicalName);
+    });
+    if (!taken && lower(strayName) == lower(stray.canonicalName)) {
+      // Only the case differs ("...gczelda2.GCI"): on a case-insensitive card -- Windows, the
+      // Switch's SD -- that is the canonical file itself, so keep it under its own name.
+      files.push_back({stray.file, stray.fileSize, stray.path.filename().u8string(), false});
+      continue;
+    }
+    if (taken || check_new_path(destination) != ECardResult::READY) {
+      Log.warn("Ignoring GCI file '{}': it holds the save '{}', and that file already exists", strayName,
+               stray.canonicalName);
+      continue;
+    }
+    std::filesystem::rename(stray.path, destination, ec);
+    if (ec) {
+      Log.warn("Ignoring GCI file '{}': renaming it to '{}' failed: {}", strayName, stray.canonicalName, ec.message());
+      continue;
+    }
+    Log.info("Renamed GCI file '{}' to '{}' so the game can find it", strayName, stray.canonicalName);
+    files.push_back({stray.file, stray.fileSize, destination.filename().u8string(), false});
   }
 
   m_files = std::move(files);

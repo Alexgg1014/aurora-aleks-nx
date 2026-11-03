@@ -122,6 +122,9 @@ void aurora_shader_set_warmup_paused(uint32_t on);
 void aurora_shader_set_warmup_keep_all(uint32_t on);
 uint32_t aurora_pipeline_live_count(void);
 uint32_t aurora_shader_warmup_released(void);
+/* aleks2 (v1.1-perf-lab): background warmup recipes still waiting to compile (the game's own requests are not counted),
+   scoped or not. 0 once the warmup has nothing left: the game's low-memory guard only needs to watch while it runs. */
+uint32_t aurora_shader_warmup_pending(void);
 
 /* "<device>|<driver description>" as Dawn reports them; the same string a Dawn seed is
    keyed on. Writes at most size bytes (NUL-terminated); returns the full length. */

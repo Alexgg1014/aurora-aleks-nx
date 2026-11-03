@@ -719,9 +719,12 @@ void bump(std::atomic<uint64_t>& counter) noexcept {
   counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }
 
+// aleks2 (v1.1-perf-lab): at namespace scope, not a function-local static: no init-guard check on every uniform
+// rebuild (idea from KartPadNX, whose function-local statics cost 8 % of fifo::process; our own change).
+ByteBuffer g_scratchBlock;
+
 ByteBuffer& scratch_block() noexcept {
-  static ByteBuffer buf;
-  return buf;
+  return g_scratchBlock;
 }
 
 gfx::Range push_full(const ByteBuffer& block) noexcept {

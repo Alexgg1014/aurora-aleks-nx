@@ -51,6 +51,7 @@ struct View {
     uint32_t baseMip = 0, mipCount = 1;
     DkImageView view{};  // pImage set to &tex->image
     uint32_t slot = 0;   // the image descriptor (render worker; 0 until first sampled)
+    uint32_t storageSlot = 0;  // v1.1: its load/store descriptor (dk_modgfx.cpp; 0 until first bound as storage)
 };
 
 struct Samp {

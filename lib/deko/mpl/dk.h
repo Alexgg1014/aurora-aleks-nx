@@ -102,6 +102,13 @@ void block_free_deferred(DkMemBlock b);  // any thread: destroyed as image_free_
 // Copies DKSH into the code block and initializes the shader; false (logged) if full or invalid.
 // Thread-safe.
 bool code_load(DkShader& shader, const void* dksh, uint32_t size, const char* name);
+// v1.1: a DKSH program's per-warp scratch memory in bytes (0 if it is not one)
+uint32_t dksh_scratch(const void* dksh, uint32_t size);
+// v1.1: the queue's per-warp scratch memory (device.cpp). A graphics shader has to fit in it (past it the GPU
+// faults); deko3d runs a compute shader throttled to fewer SMs up to kNumSms times it, and aborts past that
+// (ComputeQueue::bindShader). Twilit Essentials 3's water has a 18 KiB fragment shader and a 34 KiB compute one.
+constexpr uint32_t kPerWarpScratch = 36 * DK_PER_WARP_SCRATCH_MEM_ALIGNMENT;  // 18 KiB
+constexpr uint32_t kNumSms = 2;                                              // Tegra X1
 // whether code_load wrote code since the last call (render worker: then the GPU's shader caches are invalidated
 // before the next shader bind, so they cannot keep stale lines of the new code's addresses, e.g. prefetched)
 bool code_take_written();
@@ -139,6 +146,7 @@ enum : uint32_t { kSamplerLinearClamp = 0, kSamplerNearestClamp = 1, kReservedSa
 void descriptors_frame_start();  // binds the sets; writes the reserved samplers once; retires slots
 void write_image_descriptor(uint32_t slot, const DkImage& image);
 void write_image_view_descriptor(uint32_t slot, const DkImageView& view);
+void write_storage_image_descriptor(uint32_t slot, const DkImageView& view);  // v1.1: load/store usage
 uint32_t image_slot_alloc();      // a free slot at or above kReservedImages; 0 when none (logged)
 void image_slot_free(uint32_t slot);
 // A sampler slot for this sampler (key: a hash of it), written now if new; slots are kept by key and
@@ -233,6 +241,7 @@ struct ShaderEntry {
     std::atomic<uint32_t> skippedDraws{0};  // draws skipped waiting for it (the worker's queue order)
     DkShader shader{};
     std::vector<uint8_t> dksh;  // Compiled: the uam output until it is loaded
+    uint32_t scratch = 0;       // v1.1: its DKSH's per-warp scratch memory (set as it is loaded)
 };
 // The entry of a stage's GLSL hash, created (Missing) if new. Stable pointers, never freed.
 ShaderEntry* shader_entry(ShaderStage stage, uint64_t glslHash);
@@ -249,7 +258,8 @@ bool shader_compile(ShaderEntry* e, const std::string& glsl, bool foreground);
 bool shader_wait(ShaderEntry* e);
 // Render worker: the entry is drawable now; a Compiled one is loaded if this frame's budget
 // (COS_DK_SHADER_BUDGET, default 64; 0 = no limit) allows. Counts a skipped draw otherwise.
-bool shader_usable(ShaderEntry* e);
+// v1.1: force loads a Compiled one whatever the budget (mods' shaders: dk_modgfx.cpp)
+bool shader_usable(ShaderEntry* e, bool force = false);
 void shaders_frame_start();  // the budget's frame (render worker)
 // Starts the uam worker and reads dksh_local.bin (after shader_cache_init).
 void shaders_init(uint32_t gxConfigVersion);
